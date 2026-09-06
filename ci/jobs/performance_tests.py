@@ -1317,10 +1317,32 @@ def find_master_build(commits, build_type):
 
 def local_master_track_commits(local_master_commits_to_check_for_build):
     """Master shas below the merge base for a local run, which has no `master_track_commits_sha` kv data."""
-    return Shell.get_output(
+    # resolving 'master' via upstream or origin as a fallback; added 'main' just in case
+    master_ref = next(
+        (
+            ref
+            for ref in ("upstream/master", "upstream/main", "origin/master", "origin/main")
+            if Shell.check(f"git rev-parse --verify --quiet {ref} > /dev/null")
+        ),
+        "origin/master",
+    )
+    # resolving merge-base up front and fail loud (return []) instead of silently walking HEAD.
+    merge_base = Shell.get_output(f"git merge-base HEAD {master_ref}").strip()
+    if not merge_base:
+        print(
+            "WARNING: could not resolve merge-base with upstream master; "
+            "skipping local master-track commits"
+        )
+        return []
+    commits = Shell.get_output(
         f"git log --first-parent --format=%H -n {local_master_commits_to_check_for_build} "
-        "$(git merge-base HEAD origin/master)"
+        f"{merge_base}"
     ).split()
+    # Drop first commit on the branch
+    head = Shell.get_output("git rev-parse HEAD").strip()
+    if commits and commits[0] == head:
+        commits.pop(0)
+    return commits
 
 
 def find_prev_build(info, build_type):
