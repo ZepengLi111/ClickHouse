@@ -2484,6 +2484,14 @@ bool Aggregator::executeOnBlock(Columns columns,
         && result.isTwoLevel() && worth_convert_to_two_level
         && current_memory_usage > static_cast<Int64>(params.max_bytes_before_external_group_by))
     {
+        /// Records staged before the thaw stay published for the merge, and flushing this table
+        /// cannot free them, so left resident they hold every later block over the threshold.
+        /// The flag also reports that the shared drain table the sweep routes into exists.
+        if (adaptive->session->initialized.load(std::memory_order_acquire))
+        {
+            flushPendingChunks(*adaptive);
+            drainStagedChunksUnderMemoryPressure(*adaptive->session);
+        }
         if (auto sampled = releaseAdaptiveDrainResidue(*adaptive->session))
             spill_decision_memory = *sampled;
     }
