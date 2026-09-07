@@ -498,12 +498,14 @@ void ArrowIPCBlockInputFormat::prepareFileReader()
     /// would needlessly fail on a corrupt dictionary body when the counts are already in the footer.
     if (!need_only_count)
     {
-        /// Decode all dictionary batches up front (the registry must be populated before any record batch).
+        /// File dictionaries apply to every record batch, including batches preceding them in the file.
+        /// Deltas extend dictionaries in footer order. Each id permits only one non-delta batch.
         collectDictionaryFields(arrow_schema->fields);
         /// Subset reads: only the dictionaries the requested columns reference are decoded; the bodies of
         /// dictionaries used solely by unrequested top-level fields are skipped (see the loop below).
         auto temp_decoder = std::make_unique<ArrowIPC::RecordBatchDecoder>(*arrow_schema, format_settings, dictionaries);
         dictionary_uses = temp_decoder->collectDictionaryUses(&requested_top_level_fields, &requested_field_target_types);
+        UnorderedSetWithMemoryTracking<Int64> base_dictionary_ids;
         for (const auto & block : footer.dictionary_blocks)
         {
             seekable->seek(block.offset, SEEK_SET);
@@ -524,6 +526,8 @@ void ArrowIPCBlockInputFormat::prepareFileReader()
             /// projected read.
             if (!dictionary_uses.contains(id))
                 continue;
+            if (!dict_batch->isDelta() && !base_dictionary_ids.insert(id).second)
+                throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow IPC file contains a replacement for dictionary id {}", id);
             /// The footer block fixes this message's body size; a message claiming a different (e.g. huge)
             /// body length is corrupt and would otherwise force reading past the footer-declared boundary.
             if (msg.body_length != block.body_length)
