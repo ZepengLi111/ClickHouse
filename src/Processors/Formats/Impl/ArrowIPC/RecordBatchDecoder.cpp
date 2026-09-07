@@ -1643,9 +1643,6 @@ ColumnPtr RecordBatchDecoder::decodeField(
         throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow IPC field node has a negative length {}", node_length);
     const size_t rows = static_cast<size_t>(node_length);
 
-    if (invisible_rows && invisible_rows->size() != rows)
-        invisible_rows = nullptr;
-
     /// Dictionary fields store index validity and indices here; their value layout is in `DictionaryBatch`.
     /// The value-type branches apply only to fields whose values are inline.
     const bool is_dictionary = field.dictionary.has_value();
@@ -2074,7 +2071,7 @@ void RecordBatchDecoder::prepareBuffers(const flatbuf::RecordBatch & batch, cons
     /// rather than restating its arithmetic here. The per-buffer frame bound below caps every
     /// `out_len` far short of this, so keep it as the backstop on the running total.
     static constexpr size_t MAX_DECOMPRESSED_BODY_SIZE = 1ULL << 62;
-    auto checkBodySize = [](size_t n)
+    auto check_body_size = [](size_t n)
     {
         if (n >= MAX_DECOMPRESSED_BODY_SIZE)
             throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow IPC decompressed body size {} is too large to allocate", n);
@@ -2105,7 +2102,7 @@ void RecordBatchDecoder::prepareBuffers(const flatbuf::RecordBatch & batch, cons
             throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow IPC decompressed body size overflows");
         pos = (pos + 7) & ~size_t(7);
         /// Check the aligned running total here, before the zero-length `continue` below can skip it.
-        checkBodySize(pos);
+        check_body_size(pos);
         if (length == 0)
         {
             placements[i] = {pos, 0, nullptr, 0, true};
@@ -2153,7 +2150,7 @@ void RecordBatchDecoder::prepareBuffers(const flatbuf::RecordBatch & batch, cons
             throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow IPC decompressed body size overflows");
         placements[i] = {pos, out_len, src + 8, static_cast<size_t>(length - 8), uncompressed_length < 0};
         pos += out_len;
-        checkBodySize(pos);
+        check_body_size(pos);
     }
 
     decompressed_body.resize(pos);
