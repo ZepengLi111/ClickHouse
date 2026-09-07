@@ -315,23 +315,25 @@ DROP TABLE IF EXISTS tab_scann_few_leaves;
 CREATE TABLE tab_scann_few_leaves (id Int32, vec Array(Float32), INDEX idx vec TYPE vector_similarity('scann', 'L2Distance', 2))
     ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 8192;
 INSERT INTO tab_scann_few_leaves
-    SELECT toInt32(number), [toFloat32(number), toFloat32(0.0)]
+    -- Keep one dimension at the smallest normal Float32 value. ScaNN must not
+    -- overflow its per-dimension int8 quantization multiplier while training.
+    SELECT toInt32(number), [toFloat32(1.1754943508222875e-38), toFloat32(number)]
     FROM numbers(2000);
 OPTIMIZE TABLE tab_scann_few_leaves FINAL;
 -- count() = 1 means exactly 100 rows were returned.
 SELECT count() = 100 FROM (
-    WITH [toFloat32(1000), toFloat32(0.0)] AS ref
+    WITH [toFloat32(1.1754943508222875e-38), toFloat32(1000)] AS ref
     SELECT id FROM tab_scann_few_leaves ORDER BY L2Distance(vec, ref) ASC LIMIT 100
     SETTINGS vector_search_with_rescoring = 0, use_skip_indexes = 1, scann_num_leaves_to_search = 1
 );
 -- Fallback uses exact distances so results must match brute-force.
 -- Use a secondary sort on id to break ties deterministically at the LIMIT boundary.
 SELECT count() FROM (
-    WITH [toFloat32(1000), toFloat32(0.0)] AS ref
+    WITH [toFloat32(1.1754943508222875e-38), toFloat32(1000)] AS ref
     SELECT id FROM tab_scann_few_leaves ORDER BY L2Distance(vec, ref) ASC, id ASC LIMIT 100
     SETTINGS vector_search_with_rescoring = 0, use_skip_indexes = 1, scann_num_leaves_to_search = 1
     EXCEPT
-    WITH [toFloat32(1000), toFloat32(0.0)] AS ref
+    WITH [toFloat32(1.1754943508222875e-38), toFloat32(1000)] AS ref
     SELECT id FROM tab_scann_few_leaves ORDER BY L2Distance(vec, ref) ASC, id ASC LIMIT 100
     SETTINGS use_skip_indexes = 0
 );
