@@ -3259,13 +3259,6 @@ ConjunctionNodes getConjunctionNodes(ActionsDAG::Node * predicate, std::unordere
         {
             if (cur.num_allowed_children == cur.node->children.size())
             {
-                /// A lambda body is not part of this DAG, so the metadata of the node holding it says
-                /// nothing about what the body computes. `allNodeFunctions` enters the body, or a
-                /// conjunct such as `arrayExists(z -> rand(z) % 2 = 0, [a])` is classified pushable and
-                /// moved below a JOIN, where it is evaluated on the pre-join rows only.
-                /// Statefulness is deliberately not tested here: it is vetoed for the whole step by
-                /// ActionsDAG::hasStatefulFunctions, so vetoing it per conjunct would let a
-                /// deterministic sibling move and change the row set the stateful function sees.
                 bool is_deprecated_function = !allow_non_deterministic_functions
                     && !allNodeFunctions(
                         *cur.node, [](const IFunctionBase & function) { return function.isDeterministicInScopeOfQuery(); });
