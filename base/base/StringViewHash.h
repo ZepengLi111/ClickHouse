@@ -327,6 +327,11 @@ struct CRC32Hash
         // Fill upper bits with the same value as the lower ones.
         return (res << 32) | res;
     }
+
+    uint32_t operator()(const char * data, size_t size) const
+    {
+        return static_cast<uint32_t>((*this)(std::string_view{data, size}));
+    }
 };
 
 struct StringViewHash : CRC32Hash {};

@@ -1679,11 +1679,10 @@ void MergeTreeIndexTextGranuleBuilder::seedDropFilter()
 
     bool inserted = false;
     TokenToPostingsBuilderMap::LookupResult it{};
-    auto hash_fn = [](const char * d, size_t s) { return static_cast<uint32_t>(StringViewHash()(std::string_view(d, s))); };
     for (const auto & filter_token : filter_tokens)
     {
         memcpy(data, filter_token.data(), filter_token.size());
-        auto key = PackedStringRef::build(data, filter_token.size(), hash_fn);
+        auto key = PackedStringRef::build(data, filter_token.size(), StringViewHash{});
         data += filter_token.size();
 
         tokens_map.emplace(key, it, inserted);
@@ -1697,8 +1696,7 @@ void MergeTreeIndexTextGranuleBuilder::addToken(std::string_view token, UInt32 t
     bool inserted = false;
     TokenToPostingsBuilderMap::LookupResult it{};
 
-    auto hash_fn = [](const char * d, size_t s) { return static_cast<uint32_t>(StringViewHash()(std::string_view(d, s))); };
-    auto packed_key = PackedStringRef::build(token.data(), token.size(), hash_fn);
+    auto packed_key = PackedStringRef::build(token.data(), token.size(), StringViewHash{});
 
     if (postprocessor_drop_filter && !postprocessor_drop_filter->drop_on_match)
     {
