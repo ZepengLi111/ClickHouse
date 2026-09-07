@@ -1047,9 +1047,18 @@ void buildQueryGraph(QueryGraphBuilder & query_graph, QueryPlan::Node & node, Qu
         query_graph.type_changes[total_inputs - 1] = std::move(right_changes_types);
 
     BitSet join_expression_sources;
-    /// Relations on which the whole ON clause rejects nulls, for the CD-A conflict detector. The ON
+    /// Relations on which the whole ON clause rejects nulls, for the conflict detectors. The ON
     /// clause is the conjunction of the `join_expression` conjuncts, so a relation is rejecting for
     /// the operator as soon as any conjunct rejects on it -- hence the union.
+    ///
+    /// Null-rejection is only meaningful when an unmatched outer-join row is padded with a real SQL
+    /// NULL, i.e. under `join_use_nulls = 1`. With `join_use_nulls = 0` (the default) the padded value
+    /// is a type default (`0`/`''`), so a "null-rejecting" predicate like `t2.id = t3.id` still
+    /// matches the padded `0`; trusting null-rejection then unlocks unsound assoc/asscom reorderings
+    /// -- e.g. `(t1 LEFT JOIN t2) LEFT JOIN t3` becoming `t1 LEFT JOIN (t2 LEFT JOIN t3)`, which
+    /// changes the result. So we claim no null-rejection unless `join_use_nulls` is on, which makes
+    /// the detectors fall back to the conservative (correct) outer-join reordering in that case.
+    const bool trust_null_rejection = query_graph.context->optimization_settings.join_use_nulls;
     BitSet cda_nr_rels;
     for (const auto * old_node : join_expression)
     {
@@ -1059,7 +1068,8 @@ void buildQueryGraph(QueryGraphBuilder & query_graph, QueryPlan::Node & node, Qu
 
         /// Collect all sources from join expressions
         join_expression_sources |= edge.getSourceRelations();
-        cda_nr_rels |= predicateNullRejectingRelations(new_node, query_graph.expression_actions);
+        if (trust_null_rejection)
+            cda_nr_rels |= predicateNullRejectingRelations(new_node, query_graph.expression_actions);
 
         /// ON-clause predicates of an outer join must be applied exactly at the step
         /// that joins the null-supplying relation, in its ON clause.
