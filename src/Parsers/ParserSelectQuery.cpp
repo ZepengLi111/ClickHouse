@@ -937,6 +937,7 @@ SELECT [DISTINCT [ON (column1, column2, ...)]] expr_list
 [ORDER BY expr_list] [WITH FILL] [FROM expr] [TO expr] [STEP expr] [INTERPOLATE [(expr_list)]]
 [LIMIT [offset_value, ]n BY columns]
 [LIMIT [n, ]m] [WITH TIES]
+[LIMIT [n] AFTER start_expr [ALL] [UNTIL end_expr] | LIMIT [n] UNTIL end_expr]
 [SETTINGS ...]
 [UNION  ...]
 [INTO OUTFILE filename [TRUNCATE] [COMPRESSION type [LEVEL level]] ]
@@ -1099,7 +1100,7 @@ An extra two rows are calculated – the minimums and maximums, respectively. Th
 
 In `JSON*` and `XML` formats, the extreme values are output in a separate 'extremes' field. In `TabSeparated*`, `CSV*` and `Vertical` formats, the row comes after the main result, and after 'totals' if present. It is preceded by an empty row (after the other data). In `Pretty*` formats, the row is output as a separate table after the main result, and after `totals` if present. In `Template` format the extreme values are output according to specified template.
 
-Extreme values are calculated for rows before `LIMIT`, but after `LIMIT BY`. However, when using `LIMIT offset, size`, the rows before `offset` are included in `extremes`. In stream requests, the result may also include a small number of rows that passed through `LIMIT`.
+Extreme values are calculated for rows before `LIMIT`, but after `LIMIT BY`. However, when using `LIMIT offset, size`, the rows before `offset` are included in `extremes`. A [`LIMIT ... AFTER ... UNTIL`](/reference/statements/select/limit#limit-after-until) range behaves like `LIMIT` here: the extremes are calculated over the rows read before the range is applied. In stream requests, the result may also include a small number of rows that passed through `LIMIT`.
 
 ### Notes {#notes}
 
@@ -1197,6 +1198,7 @@ SELECT [DISTINCT [ON (column1, column2, ...)]] expr_list
 [ORDER BY expr_list] [WITH FILL] [FROM expr] [TO expr] [STEP expr] [INTERPOLATE [(expr_list)]]
 [LIMIT [offset_value, ]n BY columns]
 [LIMIT [n, ]m] [WITH TIES]
+[LIMIT [n] AFTER start_expr [ALL] [UNTIL end_expr] | LIMIT [n] UNTIL end_expr]
 [SETTINGS ...]
 [UNION ALL|DISTINCT ...]
 [INTO OUTFILE filename [COMPRESSION type [LEVEL level]] ]
@@ -1310,6 +1312,7 @@ It is possible to obtain the same result by applying [GROUP BY](/reference/state
 
 - `DISTINCT` can be applied together with `GROUP BY`.
 - When [ORDER BY](/reference/statements/select/order-by) is omitted and [LIMIT](/reference/statements/select/limit) is defined, the query stops running immediately after the required number of different rows has been read.
+- When `ORDER BY` is omitted, the same holds for a [`LIMIT ... AFTER ... UNTIL`](/reference/statements/select/limit#limit-after-until) range without `ALL`: the query stops running once the range has ended.
 - Data blocks are output as they are processed, without waiting for the entire query to finish running.
 )DOCS_MD",
         .syntax = R"(
@@ -2312,7 +2315,7 @@ When merging data flushed to the disk, as well as when merging results from remo
 
 When external aggregation is enabled, if there was less than `max_bytes_before_external_group_by` of data (i.e. data was not flushed), the query runs just as fast as without external aggregation. If any temporary data was flushed, the run time will be several times longer (approximately three times).
 
-If you have an [ORDER BY](/reference/statements/select/order-by) with a [LIMIT](/reference/statements/select/limit) after `GROUP BY`, then the amount of used RAM depends on the amount of data in `LIMIT`, not in the whole table. But if the `ORDER BY` does not have `LIMIT`, do not forget to enable external sorting (`max_bytes_before_external_sort`).
+If you have an [ORDER BY](/reference/statements/select/order-by) with a [LIMIT](/reference/statements/select/limit) after `GROUP BY`, then the amount of used RAM depends on the amount of data in `LIMIT`, not in the whole table. A [`LIMIT ... AFTER ... UNTIL`](/reference/statements/select/limit#limit-after-until) range gives no such saving, because the sort cannot know how many rows the range will need. But if the `ORDER BY` does not have `LIMIT`, do not forget to enable external sorting (`max_bytes_before_external_sort`).
 )DOCS_MD",
         .syntax = R"(
 SELECT ... GROUP BY expr_list [WITH ROLLUP | WITH CUBE] [WITH TOTALS] ...
@@ -2635,7 +2638,7 @@ SELECT * FROM collate_test ORDER BY s ASC COLLATE 'en';
 
 ## Implementation Details {#implementation-details}
 
-Less RAM is used if a small enough [LIMIT](/reference/statements/select/limit) is specified in addition to `ORDER BY`. Otherwise, the amount of memory spent is proportional to the volume of data for sorting. For distributed query processing, if [GROUP BY](/reference/statements/select/group-by) is omitted, sorting is partially done on remote servers, and the results are merged on the requestor server. This means that for distributed sorting, the volume of data to sort can be greater than the amount of memory on a single server.
+Less RAM is used if a small enough [LIMIT](/reference/statements/select/limit) is specified in addition to `ORDER BY`. Otherwise, the amount of memory spent is proportional to the volume of data for sorting. A [`LIMIT ... AFTER ... UNTIL`](/reference/statements/select/limit#limit-after-until) range does not reduce it, because the size of the range is unknown until the data is sorted. For distributed query processing, if [GROUP BY](/reference/statements/select/group-by) is omitted, sorting is partially done on remote servers, and the results are merged on the requestor server. This means that for distributed sorting, the volume of data to sort can be greater than the amount of memory on a single server.
 
 If there is not enough RAM, it is possible to perform sorting in external memory (creating temporary files on a disk). Use the setting `max_bytes_before_external_sort` for this purpose. If it is set to 0 (the default), external sorting is disabled. If it is enabled, when the volume of data to sort reaches the specified number of bytes, the collected data is sorted and dumped into a temporary file. After all data is read, all the sorted files are merged and the results are output. Files are written to the `/var/lib/clickhouse/tmp/` directory in the config (by default, but you can use the `tmp_path` parameter to change this setting). You can also use spilling to disk only if query exceeds memory limits, i.e. `max_bytes_ratio_before_external_sort=0.6` will enable spilling to disk only once the query hits `60%` memory limit (user/sever).
 
@@ -2647,7 +2650,7 @@ External sorting works much less effectively than sorting in RAM.
 
  If `ORDER BY` expression has a prefix that coincides with the table sorting key, you can optimize the query by using the [optimize_read_in_order](/reference/settings/session-settings/optimize#optimize_read_in_order) setting.
 
- When the `optimize_read_in_order` setting is enabled, the ClickHouse server uses the table index and reads the data in order of the `ORDER BY` key. This allows to avoid reading all data in case of specified [LIMIT](/reference/statements/select/limit). So queries on big data with small limit are processed faster.
+ When the `optimize_read_in_order` setting is enabled, the ClickHouse server uses the table index and reads the data in order of the `ORDER BY` key. This allows to avoid reading all data in case of specified [LIMIT](/reference/statements/select/limit). The same holds for a [`LIMIT ... AFTER ... UNTIL`](/reference/statements/select/limit#limit-after-until) range without `ALL`, which stops reading once its range has ended. So queries on big data with small limit are processed faster.
 
 Optimization works with both `ASC` and `DESC` and does not work together with the [GROUP BY](/reference/statements/select/group-by) clause. With the [FINAL](/reference/statements/select/from#final-modifier) modifier, the optimization works in the direct order of the sorting key, and for [ReplacingMergeTree](/reference/engines/table-engines/mergetree-family/replacingmergetree) tables also in the reverse order, controlled by the `optimize_read_in_reverse_order_final` setting.
 
@@ -2665,7 +2668,7 @@ In `MaterializedView`-engine tables the optimization works with views like `SELE
 
 ## ORDER BY Expr WITH FILL Modifier {#order-by-expr-with-fill-modifier}
 
-This modifier also can be combined with [LIMIT ... WITH TIES modifier](/reference/statements/select/limit#limit--with-ties-modifier).
+This modifier also can be combined with [LIMIT ... WITH TIES modifier](/reference/statements/select/limit#limit--with-ties-modifier) and with the [LIMIT ... AFTER ... UNTIL](/reference/statements/select/limit#limit-after-until) range form.
 
 `WITH FILL` modifier can be set after `ORDER BY expr` with optional `FROM expr`, `TO expr` and `STEP expr` parameters.
 All missed values of `expr` column will be filled sequentially and other columns will be filled as defaults.
@@ -3042,7 +3045,7 @@ SELECT ... ORDER BY expr [ASC | DESC] [NULLS FIRST | NULLS LAST] [COLLATE 'local
     factory.registerStatement("LIMIT",
     {
         .description = R"DOCS_MD(
-The `LIMIT` clause controls how many rows are returned from your query results.
+The `LIMIT` clause controls how many rows are returned from your query results. Rows can be selected by count and offset, or by the conditions that open and close a range of rows with [`LIMIT ... AFTER ... UNTIL`](#limit-after-until).
 
 ## Basic syntax {#basic-syntax}
 
@@ -3075,6 +3078,15 @@ LIMIT n, m
 Skips the first `n` rows, then returns the next `m` rows.
 
 In both forms, `n` and `m` must be non-negative integers.
+
+**Select a range by conditions:**
+
+```sql
+LIMIT [n] AFTER start_expr [UNTIL end_expr]
+LIMIT [n] UNTIL end_expr
+```
+
+Returns the rows from the first row where `start_expr` is true, or from the start of the stream when `AFTER` is omitted, up to but excluding the first row where `end_expr` is true; `n` caps the length of that range. `AFTER start_expr ALL` opens a range at every matching row. See [LIMIT ... AFTER ... UNTIL](#limit-after-until) below.
 
 ## Negative limits {#negative-limits}
 
@@ -3113,9 +3125,11 @@ LIMIT 10 OFFSET 0.5    -- 10 rows starting from the halfway point
 LIMIT 10 OFFSET -20    -- 10 rows after skipping the last 20
 ```
 
+The [range form](#limit-after-until) combines only with a plain row count: `LIMIT 3 AFTER start_expr` takes at most three rows from where the range opens. `OFFSET`, fractional and negative counts, and `WITH TIES` are rejected together with `AFTER` or `UNTIL`. A [`LIMIT BY`](/reference/statements/select/limit-by) clause can precede a range in the same query, and the [`limit`](/reference/settings/session-settings/other#limit) setting still caps the result.
+
 ## LIMIT ... WITH TIES {#limit--with-ties-modifier}
 
-The `WITH TIES` modifier includes additional rows that have the same `ORDER BY` values as the last row in your limit.
+The `WITH TIES` modifier includes additional rows that have the same `ORDER BY` values as the last row in your limit. It applies to count and offset limits only and cannot be combined with the [range form](#limit-after-until).
 
 ```sql
 SELECT * FROM (
@@ -3260,6 +3274,21 @@ SELECT number FROM numbers(10) ORDER BY number LIMIT AFTER number >= 7;
 └────────┘
 ```
 
+Without `n` but with `UNTIL`, the range runs from the first `AFTER` match up to the first `UNTIL` match:
+
+```sql
+SELECT number FROM numbers(10) ORDER BY number LIMIT AFTER number >= 2 UNTIL number >= 6;
+```
+
+```response
+┌─number─┐
+│      2 │
+│      3 │
+│      4 │
+│      5 │
+└────────┘
+```
+
 Emit 2 rows after every matching row, without duplicating overlaps:
 
 ```sql
@@ -3276,11 +3305,85 @@ SELECT number FROM numbers(10) ORDER BY number LIMIT 2 AFTER number IN (2, 3, 6)
 └────────┘
 ```
 
+With `ALL` and `UNTIL`, every opened range ends at its `n` rows or at the next `UNTIL` match, whichever comes first; here the range opened at 6 is cut by `number = 7`:
+
+```sql
+SELECT number FROM numbers(10) ORDER BY number LIMIT 2 AFTER number IN (2, 6) ALL UNTIL number = 7;
+```
+
+```response
+┌─number─┐
+│      2 │
+│      3 │
+│      6 │
+└────────┘
+```
+
+Without `n`, an `UNTIL` match closes the current range and a later `AFTER` match opens a new one, which runs to the end when no further `UNTIL` match follows:
+
+```sql
+SELECT number FROM numbers(10) ORDER BY number LIMIT AFTER number IN (2, 6) ALL UNTIL number = 4;
+```
+
+```response
+┌─number─┐
+│      2 │
+│      3 │
+│      6 │
+│      7 │
+│      8 │
+│      9 │
+└────────┘
+```
+
+Without `n` and without `UNTIL`, every opened range runs to the end of the stream, so `AFTER start_expr ALL` returns the same rows as `AFTER start_expr`.
+
 :::note
 - `WITH TIES`, fractional/negative `LIMIT`/`OFFSET`, and `OFFSET` are not supported together with `AFTER`/`UNTIL`.
 - Preliminary `LIMIT` pushdown is disabled when `AFTER`/`UNTIL` is used.
 - `AFTER` and `UNTIL` are recognized as keywords only when a boundary expression follows them, so an identifier named `after` or `until` still works as a row count (`LIMIT after`, `LIMIT after BY x`). When both readings are possible the keyword wins: `LIMIT after(2)` is the range `LIMIT AFTER (2)`; write `LIMIT (after(2))` to call a function named `after`.
 :::
+
+`UNTIL` alone returns the rows from the start of the stream up to the first row where the condition is true:
+
+```sql
+SELECT number FROM numbers(10) ORDER BY number LIMIT UNTIL number >= 3;
+```
+
+```response
+┌─number─┐
+│      0 │
+│      1 │
+│      2 │
+└────────┘
+```
+
+With `n`, `UNTIL` alone returns at most `n` rows from the start of the stream, still stopping at the first match:
+
+```sql
+SELECT number FROM numbers(10) ORDER BY number LIMIT 2 UNTIL number >= 3;
+```
+
+```response
+┌─number─┐
+│      0 │
+│      1 │
+└────────┘
+```
+
+A range can follow [`LIMIT BY`](/reference/statements/select/limit-by) and then applies to the rows that `LIMIT BY` keeps:
+
+```sql
+SELECT number % 4 AS k, number FROM numbers(12) ORDER BY k, number LIMIT 2 BY k LIMIT 3 AFTER k >= 1;
+```
+
+```response
+┌─k─┬─number─┐
+│ 1 │      1 │
+│ 1 │      5 │
+│ 2 │      2 │
+└───┴────────┘
+```
 
 ## Considerations {#considerations}
 
@@ -3296,6 +3399,9 @@ SELECT number FROM numbers(10) ORDER BY number LIMIT 2 AFTER number IN (2, 3, 6)
 SELECT ... LIMIT m [WITH TIES]
 SELECT ... LIMIT n, m [WITH TIES]
 SELECT ... LIMIT m OFFSET n [WITH TIES]
+SELECT ... LIMIT [n] AFTER start_expr [UNTIL end_expr]
+SELECT ... LIMIT [n] AFTER start_expr ALL [UNTIL end_expr]
+SELECT ... LIMIT [n] UNTIL end_expr
 SELECT TOP m ...
 )",
         .parent = "SELECT",
@@ -3315,7 +3421,7 @@ ClickHouse supports the following syntax variants:
 During query processing, ClickHouse selects data ordered by sorting key. The sorting key is set explicitly using an [ORDER BY](/reference/statements/select/order-by) clause or implicitly as a property of the table engine (row order is only guaranteed when using [ORDER BY](/reference/statements/select/order-by), otherwise the row blocks will not be ordered due to multi-threading). Then ClickHouse applies `LIMIT n BY expressions` and returns the first `n` rows for each distinct combination of `expressions`. If `OFFSET` is specified, then for each data block that belongs to a distinct combination of `expressions`, ClickHouse skips `offset_value` number of rows from the beginning of the block and returns a maximum of `n` rows as a result. If `offset_value` is bigger than the number of rows in the data block, ClickHouse returns zero rows from the block.
 
 <Note>
-`LIMIT BY` is not related to [LIMIT](/reference/statements/select/limit). They can both be used in the same query.
+`LIMIT BY` is not related to [LIMIT](/reference/statements/select/limit). They can both be used in the same query. This includes the [`LIMIT ... AFTER ... UNTIL`](/reference/statements/select/limit#limit-after-until) range form, which then applies to the rows `LIMIT BY` keeps.
 </Note>
 
 If you want to use column numbers instead of column names in the `LIMIT BY` clause, enable the setting [enable_positional_arguments](/reference/settings/session-settings/enable-positional-arguments#enable_positional_arguments).
@@ -3519,6 +3625,8 @@ SELECT ... LIMIT n OFFSET offset_value BY expressions ...
 -- MySQL/PostgreSQL style:
 [LIMIT [n, ]m] [OFFSET offset_row_count]
 ```
+
+The SQL standard `OFFSET ... FETCH` forms cannot be combined with the [`LIMIT ... AFTER ... UNTIL`](/reference/statements/select/limit#limit-after-until) range form.
 
 The `offset_row_count` or `fetch_row_count` value can be a number or a literal constant. You can omit `fetch_row_count`; by default, it equals to 1.
 
