@@ -55,14 +55,12 @@ namespace ErrorCodes
 
 namespace
 {
-/// Structural equality of two parsed Arrow types (kind plus every type attribute, recursing into
-/// children). Used to verify that a reused Arrow dictionary id describes the same value type.
-bool arrowTypesEqual(const ArrowIPC::ArrowType & a, const ArrowIPC::ArrowType & b);
+/// Compares dictionary value layouts and decoding semantics recursively.
+bool dictionaryValueTypesEqual(const ArrowIPC::ArrowType & a, const ArrowIPC::ArrowType & b);
 
-/// Equality of two Arrow fields. `compare_name` is false at the top level (a dictionary's value field is
-/// named after its column, and two columns may share a dictionary id) but true for nested children, whose
-/// names are part of the value type (e.g. Tuple element names).
-bool arrowFieldsEqual(const ArrowIPC::ArrowField & a, const ArrowIPC::ArrowField & b, bool compare_name)
+/// Struct and union element names identify dictionary value types; list and map container labels do not.
+/// Metadata matters only when `isUUIDField` changes value decoding.
+bool dictionaryValueFieldsEqual(const ArrowIPC::ArrowField & a, const ArrowIPC::ArrowField & b, bool compare_name)
 {
     if (compare_name && a.name != b.name)
         return false;
@@ -70,15 +68,12 @@ bool arrowFieldsEqual(const ArrowIPC::ArrowField & a, const ArrowIPC::ArrowField
         return false;
     if (a.dictionary != b.dictionary)
         return false;
-    /// Field metadata changes the mapped ClickHouse type for the same physical Arrow type (e.g. the Arrow
-    /// extension name maps `fixed_size_binary(16)` to `UUID` instead of `FixedString(16)`), so two fields
-    /// reusing a dictionary id must carry the same metadata, not only the same physical type.
-    if (a.custom_metadata != b.custom_metadata)
+    if (ArrowIPC::isUUIDField(a) != ArrowIPC::isUUIDField(b))
         return false;
-    return arrowTypesEqual(a.type, b.type);
+    return dictionaryValueTypesEqual(a.type, b.type);
 }
 
-bool arrowTypesEqual(const ArrowIPC::ArrowType & a, const ArrowIPC::ArrowType & b)
+bool dictionaryValueTypesEqual(const ArrowIPC::ArrowType & a, const ArrowIPC::ArrowType & b)
 {
     if (a.kind != b.kind || a.bit_width != b.bit_width || a.is_signed != b.is_signed
         || a.float_precision != b.float_precision || a.precision != b.precision || a.scale != b.scale
@@ -88,9 +83,10 @@ bool arrowTypesEqual(const ArrowIPC::ArrowType & a, const ArrowIPC::ArrowType & 
         || a.unsupported_type_name != b.unsupported_type_name || a.skip_layout != b.skip_layout
         || a.children.size() != b.children.size())
         return false;
+    const bool compare_child_names = a.kind == ArrowIPC::TypeKind::Struct || a.kind == ArrowIPC::TypeKind::Union;
     for (size_t i = 0; i < a.children.size(); ++i)
     {
-        if (!arrowFieldsEqual(a.children[i], b.children[i], /*compare_name=*/true))
+        if (!dictionaryValueFieldsEqual(a.children[i], b.children[i], compare_child_names))
             return false;
     }
     return true;
@@ -134,7 +130,7 @@ void ArrowIPCBlockInputFormat::collectDictionaryFields(const ArrowIPC::ArrowFiel
             /// overwriting the value schema — otherwise the shared `DictionaryBatch` would be decoded with
             /// one field's value type and materialized under another's (e.g. `Int32` values surfaced as a
             /// `LowCardinality(Date32)` column), bypassing validation or tripping type assertions.
-            else if (!arrowFieldsEqual(it->second, value_field, /*compare_name=*/false))
+            else if (!dictionaryValueFieldsEqual(it->second, value_field, /*compare_name=*/false))
             {
                 throw Exception(
                     ErrorCodes::INCORRECT_DATA,
