@@ -980,6 +980,32 @@ String fieldToString(const Field & x)
         x);
 }
 
+void normalizeBoolFields(Field & field)
+{
+    if (field.getType() == Field::Types::Bool)
+    {
+        field = field.safeGet<UInt64>();
+    }
+    else if (field.getType() == Field::Types::Tuple)
+    {
+        auto & tuple = field.safeGet<Tuple>();
+        for (auto & elem : tuple)
+            normalizeBoolFields(elem);
+    }
+    else if (field.getType() == Field::Types::Array)
+    {
+        auto & array = field.safeGet<Array>();
+        for (auto & elem : array)
+            normalizeBoolFields(elem);
+    }
+    else if (field.getType() == Field::Types::Map)
+    {
+        auto & map = field.safeGet<Map>();
+        for (auto & elem : map)
+            normalizeBoolFields(elem);
+    }
+}
+
 bool anyFieldSatisfies(const Field & field, bool (*predicate)(const Field &))
 {
     /// Walked with an explicit worklist, like the copy and destroy paths above, so the native stack
