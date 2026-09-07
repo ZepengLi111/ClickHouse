@@ -74,6 +74,7 @@ namespace ProfileEvents
     extern const Event AdaptiveAggregationLocalFreezes;
     extern const Event AdaptiveAggregationGiveUps;
     extern const Event AdaptiveAggregationPressureStandDowns;
+    extern const Event AdaptiveAggregationSpillBacklogSheds;
 }
 
 namespace CurrentMetrics
@@ -2489,6 +2490,7 @@ bool Aggregator::executeOnBlock(Columns columns,
         /// The flag also reports that the shared drain table the sweep routes into exists.
         if (adaptive->session->initialized.load(std::memory_order_acquire))
         {
+            ProfileEvents::increment(ProfileEvents::AdaptiveAggregationSpillBacklogSheds);
             flushPendingChunks(*adaptive);
             drainStagedChunksUnderMemoryPressure(*adaptive->session);
         }

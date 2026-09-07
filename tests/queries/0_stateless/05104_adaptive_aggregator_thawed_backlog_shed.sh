@@ -48,6 +48,13 @@ SELECT count() FROM
     GROUP BY k
 );
 
+-- This event is incremented only from the new hook, on the thawed baseline spill path in
+-- Aggregator::executeOnBlock, so it is what proves that path was taken. The two liveness
+-- assertions below it are satisfiable by the pre-existing finish-time drain as well, and the part
+-- bound is the oracle; this one pins the hook itself.
+SELECT 'shed the backlog on the thawed spill path',
+       sumIf(value, event = 'AdaptiveAggregationSpillBacklogSheds') > 0
+FROM system.events;
 -- Parts are written only once query memory crosses the external threshold, which is the condition
 -- the shedding is guarded by, so this is what proves the baseline spill decision was reached.
 SELECT 'went external', sumIf(value, event = 'ExternalAggregationWritePart') > 0 FROM system.events;
