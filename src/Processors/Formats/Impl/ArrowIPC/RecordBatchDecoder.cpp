@@ -1454,6 +1454,7 @@ ColumnPtr RecordBatchDecoder::decodeUnion(const ArrowField & field, size_t rows,
     VectorWithMemoryTracking<ColumnPtr> child_null_map_holders;
     /// Maps an Arrow union type id to a local Variant element index, or -1 for the NULL placeholder.
     UnorderedMapWithMemoryTracking<int, int> type_id_to_local;
+    size_t total_child_rows = 0;
     for (size_t child_idx = 0; child_idx < type.children.size(); ++child_idx)
     {
         const ArrowField & child = type.children[child_idx];
@@ -1520,6 +1521,7 @@ ColumnPtr RecordBatchDecoder::decodeUnion(const ArrowField & field, size_t rows,
             child_column = nullable.getNestedColumnPtr();
         }
         type_id_to_local[tid] = static_cast<int>(variant_columns.size());
+        total_child_rows += child_column->size();
         variant_columns.push_back(std::move(child_column));
         variant_types.push_back(removeNullable(child_type));
         child_null_maps.push_back(child_null_map);
@@ -1548,9 +1550,9 @@ ColumnPtr RecordBatchDecoder::decodeUnion(const ArrowField & field, size_t rows,
     auto & discr_data = local_discriminators->getData();
     auto & off_data = offsets->getData();
 
-    /// Sparse children are always compacted: each holds `rows` values of which only the selected ones
-    /// are real.
-    const bool compact_children = !dense || invisible_rows;
+    /// Sparse children are compacted to their selected values. Dense children can retain unused values
+    /// after slicing; compact them if their total exceeds the row count, as required by `ColumnVariant`.
+    const bool compact_children = !dense || invisible_rows || total_child_rows > rows;
     MutableColumns compact;
     if (compact_children)
     {
