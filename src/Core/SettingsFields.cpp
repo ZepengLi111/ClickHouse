@@ -679,6 +679,12 @@ void SettingFieldNonZeroUInt64::parseFromString(const String & str)
     checkValueNonZero();
 }
 
+void SettingFieldNonZeroUInt64::readBinary(ReadBuffer & in)
+{
+    SettingFieldUInt64::readBinary(in);
+    checkValueNonZero();
+}
+
 void SettingFieldNonZeroUInt64::checkValueNonZero() const
 {
     if (value == 0)
