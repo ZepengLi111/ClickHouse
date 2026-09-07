@@ -5,6 +5,7 @@
 #include <Processors/Formats/Impl/ArrowIPC/BufferCompression.h>
 #include <IO/NetUtils.h>
 #include <Columns/ColumnVector.h>
+#include <Columns/ColumnConst.h>
 #include <Columns/ColumnDecimal.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnFixedString.h>
@@ -197,53 +198,76 @@ String DictionaryRegistry::positionKey(const FieldPosition & position)
     return fmt::format("{}/{}", position.list_depth, position.path);
 }
 
-void DictionaryRegistry::set(Int64 id, const FieldPosition & position, ColumnPtr column, DataTypePtr type, bool is_delta)
+void DictionaryRegistry::set(Int64 id, const FieldPosition & position, Values values, bool is_delta)
 {
-    if (is_delta)
+    if (!is_delta)
     {
-        /// A delta dictionary batch appends to an existing dictionary; one whose id has no base
-        /// dictionary yet is malformed — decoding indices against only the delta values would return
-        /// wrong LowCardinality values. Reject it instead of treating the delta as a fresh dictionary.
-        auto it = dictionaries.find(id);
-        if (it == dictionaries.end())
-            throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow IPC delta dictionary batch for unknown dictionary id {}", id);
-        Values & base = it->second.at(positionKey(position));
-        /// A delta's values are appended to the registered column, so they must share its layout. The layout
-        /// a requested type gives dictionary values is fixed by the type, except for variable-width binary
-        /// under a raw-byte target (IPv6, big integers): the decoder reinterprets that leaf only when every
-        /// value has the target's width, and decides so per batch. A base of 16-byte values followed by a
-        /// delta adding a shorter one thus decodes to `Int128` and then to `String`. Such a dictionary has no
-        /// reading as the requested type as a whole — an inline column mixing the widths fails in the cast
-        /// the same way — so reject the delta rather than append values of another layout.
-        if (!base.column->structureEquals(*column))
-            throw Exception(
-                ErrorCodes::TYPE_MISMATCH,
-                "Arrow IPC delta dictionary batch for dictionary {} decodes to {} under the requested type, but the "
-                "dictionary's earlier values decoded to {}",
-                id, column->getName(), base.column->getName());
-        auto merged = IColumn::mutate(std::move(base.column));
-        merged->insertRangeFrom(*column, 0, column->size());
-        base.column = std::move(merged);
+        Dictionary dictionary;
+        dictionary.offsets.push_back(values.column->size());
+        dictionary.segments.push_back(std::move(values));
+        dictionaries[id][positionKey(position)] = std::move(dictionary);
+        return;
+    }
+
+    auto it = dictionaries.find(id);
+    if (it == dictionaries.end())
+        throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow IPC delta dictionary batch for unknown dictionary id {}", id);
+    Dictionary & dictionary = it->second.at(positionKey(position));
+    const IColumn * base_column = dictionary.segments.front().column.get();
+    const IColumn * delta_column = values.column.get();
+    if (const auto * constant = typeid_cast<const ColumnConst *>(base_column))
+        base_column = &constant->getDataColumn();
+    if (const auto * constant = typeid_cast<const ColumnConst *>(delta_column))
+        delta_column = &constant->getDataColumn();
+
+    /// Requested raw-byte conversions can produce different layouts in separate dictionary batches.
+    /// Every batch must share a layout so its referenced values can be gathered into one column.
+    if (!base_column->structureEquals(*delta_column))
+        throw Exception(
+            ErrorCodes::TYPE_MISMATCH,
+            "Arrow IPC delta dictionary batch for dictionary {} decodes to {} under the requested type, but the "
+            "dictionary's earlier values decoded to {}",
+            id, delta_column->getName(), base_column->getName());
+
+    size_t total_rows = 0;
+    if (__builtin_add_overflow(dictionary.size(), values.column->size(), &total_rows))
+        throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow IPC dictionary {} length overflows", id);
+    Values & last = dictionary.segments.back();
+    if (!isColumnConst(*last.column) && !isColumnConst(*values.column))
+    {
+        const size_t previous_rows = last.column->size();
+        const size_t added_rows = values.column->size();
+        auto merged = IColumn::mutate(std::move(last.column));
+        merged->insertRangeFrom(*values.column, 0, added_rows);
+        last.column = std::move(merged);
+        if (last.null_map || values.null_map)
+        {
+            MutableColumnPtr null_map;
+            if (last.null_map)
+                null_map = IColumn::mutate(std::move(last.null_map));
+            else
+                null_map = ColumnUInt8::create(previous_rows, UInt8{0});
+            if (values.null_map)
+                null_map->insertRangeFrom(*values.null_map, 0, added_rows);
+            else
+                null_map->insertManyDefaults(added_rows);
+            last.null_map = std::move(null_map);
+        }
+        dictionary.offsets.back() = total_rows;
     }
     else
     {
-        dictionaries[id][positionKey(position)] = Values{std::move(column), std::move(type)};
+        dictionary.offsets.push_back(total_rows);
+        dictionary.segments.push_back(std::move(values));
     }
 }
 
-const DictionaryRegistry::Values & DictionaryRegistry::get(Int64 id, const FieldPosition & position) const
+const DictionaryRegistry::Dictionary & DictionaryRegistry::get(Int64 id, const FieldPosition & position) const
 {
     auto it = dictionaries.find(id);
     if (it == dictionaries.end())
         throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow IPC record batch references unknown dictionary id {}", id);
-    /// Every position a field decodes at was collected before its dictionary was decoded
-    /// (`RecordBatchDecoder::collectDictionaryUses`), so a missing decoding is a decoder inconsistency.
-    auto values_it = it->second.find(positionKey(position));
-    if (values_it == it->second.end())
-        throw Exception(
-            ErrorCodes::LOGICAL_ERROR, "Arrow IPC dictionary {} was not decoded for the field at '{}', {} lists deep",
-            id, position.path, position.list_depth);
-    return values_it->second;
+    return it->second.at(positionKey(position));
 }
 
 MutableColumnPtr reinterpretStringLeaf(const ColumnString & str, const NullMap * null_map, const DataTypePtr & to_no_null)
@@ -340,28 +364,27 @@ const InvisibleRowsMask * maskPtr(const std::optional<InvisibleRowsMask> & mask)
     return mask ? &*mask : nullptr;
 }
 
-/// The dictionary values a field materializes. Dictionary values are decoded as a nullable array whatever the
-/// fields encoding them declare (see `ArrowIPCBlockInputFormat::collectDictionaryFields`): a null entry is a
-/// legal dictionary value, and `Field.nullable` describes the encoded array — the index validity — instead.
-/// A nullable field keeps the values as decoded, so its row is null either through the index validity or
-/// through the entry it points at. A non-nullable field takes the values without their null map and may not
-/// point at a null entry, which `decodeDictionary` checks against `null_entries`.
+/// Dictionary values reflect the referencing field's nullability. A non-nullable field removes any
+/// `Nullable` wrapper and cannot reference null entries. `null_entries` preserves that restriction for
+/// value types such as `Array`, `Map`, and plain `Tuple` whose decoded columns have no outer null map.
 struct FieldDictionaryValues
 {
     ColumnPtr column;
     DataTypePtr type;
-    /// The null map a non-nullable field left out of `column`; null when there is none to leave out.
-    const NullMap * null_entries = nullptr;
+    const IColumn * null_entries = nullptr;
 };
 
 FieldDictionaryValues dictionaryValuesFor(const ArrowField & field, const DictionaryRegistry::Values & registered)
 {
-    const auto * nullable_values
-        = field.nullable ? nullptr : typeid_cast<const ColumnNullable *>(registered.column.get());
-    if (!nullable_values)
+    if (field.nullable)
         return {registered.column, registered.type, nullptr};
-    return {
-        nullable_values->getNestedColumnPtr(), removeNullable(registered.type), &nullable_values->getNullMapData()};
+
+    ColumnPtr column;
+    if (const auto * constant = typeid_cast<const ColumnConst *>(registered.column.get()))
+        column = ColumnConst::create(removeNullable(constant->getDataColumnPtr()), constant->size());
+    else
+        column = removeNullable(registered.column);
+    return {std::move(column), removeNullable(registered.type), registered.null_map.get()};
 }
 
 /// The requested type hint of a field at dotted name `path`, `list_depth` lists below the top level. A
@@ -590,30 +613,28 @@ void fillFixed(
 
 }
 
-ColumnPtr RecordBatchDecoder::buildNullMap(const Slice & validity, size_t rows, Int64 null_count) const
+ColumnUInt8::Ptr RecordBatchDecoder::buildNullMap(const Slice & validity, size_t rows, Int64 null_count) const
 {
-    auto null_map = ColumnUInt8::create(rows);
-    auto & data = null_map->getData();
-
-    /// A field with no nulls may omit the validity bitmap (a zero-length buffer): everything is valid.
-    if (null_count == 0)
+    /// A non-zero or unknown null count requires a bitmap that covers every row.
+    if (null_count != 0)
     {
-        memset(data.data(), 0, rows);
-        return null_map;
+        if (validity.length == 0)
+            throw Exception(
+                ErrorCodes::INCORRECT_DATA,
+                "Arrow IPC field declares a null count of {} but omits the validity bitmap", null_count);
+        checkBufferSize(validity, (rows + 7) / 8, "validity");
     }
 
-    /// A non-zero (or unknown, i.e. negative) null count requires the validity bitmap to identify the
-    /// null rows; accepting an absent bitmap here would silently turn malformed nullable data into real values.
-    if (validity.length == 0)
-        throw Exception(
-            ErrorCodes::INCORRECT_DATA,
-            "Arrow IPC field declares a null count of {} but omits the validity bitmap", null_count);
-
-    checkBufferSize(validity, (rows + 7) / 8, "validity");
-    const auto * bits = reinterpret_cast<const uint8_t *>(validity.ptr);
-    /// Arrow validity bitmap is LSB-first and uses 1 = valid; ClickHouse null map uses 1 = null.
-    expandBitmapToBytes(bits, rows, data.data(), /*invert=*/true);
-
+    auto null_map = ColumnUInt8::create(rows);
+    auto & data = null_map->getData();
+    if (null_count == 0)
+        memset(data.data(), 0, rows);
+    else
+    {
+        /// Arrow validity uses 1 for valid rows; a ClickHouse null map uses 1 for null rows.
+        const auto * bits = reinterpret_cast<const uint8_t *>(validity.ptr);
+        expandBitmapToBytes(bits, rows, data.data(), /*invert=*/true);
+    }
     return null_map;
 }
 
@@ -1317,79 +1338,95 @@ ColumnPtr RecordBatchDecoder::decodeDictionary(
     const String & path, size_t list_depth)
 {
     const Slice indices_slice = nextBuffer();
-    const FieldDictionaryValues dictionary
-        = dictionaryValuesFor(field, registry.get(field.dictionary->id, FieldPosition{path, list_depth}));
-    const ColumnPtr & values = dictionary.column;
-    const size_t dict_size = values->size();
+    const DictionaryRegistry::Dictionary & dictionary
+        = registry.get(field.dictionary->id, FieldPosition{path, list_depth});
+    const size_t dictionary_size = dictionary.size();
 
     const int bits = field.dictionary->index_bit_width;
     const bool index_is_signed = field.dictionary->index_is_signed;
-    /// Validate the index width before it is used to size buffers or allocate the output indexes. An
-    /// invalid width such as 7 would make `index_size` zero (so `checkBufferSize` requires no bytes) and
-    /// let a forged huge `FieldNode::length` drive an oversized `ColumnUInt64::create(rows)` before the
-    /// `switch` over `bits` below could report the unsupported width.
+    /// The index width determines the required buffer size and must be validated before allocating indexes.
     if (bits != 8 && bits != 16 && bits != 32 && bits != 64)
         throw Exception(
             ErrorCodes::INCORRECT_DATA, "Arrow IPC dictionary index bit width {} is not supported (must be 8, 16, 32, or 64)", bits);
     const size_t index_size = static_cast<size_t>(bits) / 8;
     checkBufferSize(indices_slice, requiredBytes(rows, index_size), "dictionary indices");
 
-    /// Keys for the LowCardinality dictionary: the dictionary values the field materializes (see
-    /// `dictionaryValuesFor`) plus, for nullable fields, a trailing NULL. A nullable field's row can be null
-    /// either via the index validity or by pointing at a null entry inside the dictionary values. Invisible
-    /// rows' index bytes are undefined per the Arrow spec, so they must not be bounds-checked; for a
-    /// non-nullable field the trailing key holds the value type's default instead of NULL. The registered
-    /// type describes these values (they may have been decoded under a requested type hint, see
-    /// `DictionaryRegistry::Values`), so it — not the referencing field's natural type — declares them.
-    const DataTypePtr & value_type = dictionary.type;
-    MutableColumnPtr keys = IColumn::mutate(values->cloneResized(dict_size));
-    UInt64 fallback_key_index = dict_size;
-    if (field.nullable || invisible_rows)
-        keys->insertDefault(); /// a NULL for a Nullable value column, the type default otherwise
+    VectorWithMemoryTracking<FieldDictionaryValues> segments;
+    segments.reserve(dictionary.segments.size());
+    for (const auto & segment : dictionary.segments)
+        segments.push_back(dictionaryValuesFor(field, segment));
 
-    /// Map each row to a key index (UInt64), pointing invisible rows at the trailing key.
-    auto indexes = ColumnUInt64::create(rows);
-    auto & idx = indexes->getData();
-    for (size_t i = 0; i < rows; ++i)
+    const DataTypePtr & value_type = segments.front().type;
+    const IColumn * first_column = segments.front().column.get();
+    if (const auto * constant = typeid_cast<const ColumnConst *>(first_column))
+        first_column = &constant->getDataColumn();
+    MutableColumnPtr keys = first_column->cloneEmpty();
+    VectorWithMemoryTracking<size_t> key_starts;
+    key_starts.reserve(segments.size());
+    bool has_constant_segments = false;
+    for (const auto & segment : segments)
     {
-        if (isInvisible(invisible_rows, i))
+        key_starts.push_back(keys->size());
+        const IColumn * values = segment.column.get();
+        if (const auto * constant = typeid_cast<const ColumnConst *>(values))
         {
-            idx[i] = fallback_key_index;
+            values = &constant->getDataColumn();
+            has_constant_segments = true;
+        }
+        keys->insertRangeFrom(*values, 0, values->size());
+    }
+    const size_t default_key_index = keys->size();
+    if (invisible_rows)
+        keys->insertDefault();
+
+    /// Ordinary dictionaries have one segment whose indexes address the keys directly. Constant segments
+    /// contribute one physical key each and require translating their logical index ranges.
+    auto indexes = ColumnUInt64::create(rows);
+    auto & index_data = indexes->getData();
+    for (size_t row = 0; row < rows; ++row)
+    {
+        if (isInvisible(invisible_rows, row))
+        {
+            index_data[row] = default_key_index;
             continue;
         }
-        /// The index buffer may be signed (`DictionaryEncoding::indexType`); a negative index is invalid
-        /// and must be rejected before widening, otherwise it would wrap to a large unsigned key.
-        Int64 v = 0;
+        /// Invisible rows have undefined index bytes. Visible signed indexes must be non-negative before
+        /// they are widened and checked against the dictionary's logical size.
+        Int64 index = 0;
         switch (bits)
         {
-            case 8: v = index_is_signed ? Int64(reinterpret_cast<const int8_t *>(indices_slice.ptr)[i])
-                                        : Int64(reinterpret_cast<const uint8_t *>(indices_slice.ptr)[i]); break;
-            case 16: v = index_is_signed ? Int64(reinterpret_cast<const Int16 *>(indices_slice.ptr)[i])
-                                         : Int64(reinterpret_cast<const UInt16 *>(indices_slice.ptr)[i]); break;
-            case 32: v = index_is_signed ? Int64(reinterpret_cast<const Int32 *>(indices_slice.ptr)[i])
-                                         : Int64(reinterpret_cast<const UInt32 *>(indices_slice.ptr)[i]); break;
-            case 64: v = reinterpret_cast<const Int64 *>(indices_slice.ptr)[i]; break;
-            default: throw Exception(ErrorCodes::INCORRECT_DATA, "Unsupported Arrow dictionary index width {}", bits);
+            case 8: index = index_is_signed ? Int64(reinterpret_cast<const int8_t *>(indices_slice.ptr)[row])
+                                           : Int64(reinterpret_cast<const uint8_t *>(indices_slice.ptr)[row]); break;
+            case 16: index = index_is_signed ? Int64(reinterpret_cast<const Int16 *>(indices_slice.ptr)[row])
+                                            : Int64(reinterpret_cast<const UInt16 *>(indices_slice.ptr)[row]); break;
+            case 32: index = index_is_signed ? Int64(reinterpret_cast<const Int32 *>(indices_slice.ptr)[row])
+                                            : Int64(reinterpret_cast<const UInt32 *>(indices_slice.ptr)[row]); break;
+            case 64: index = reinterpret_cast<const Int64 *>(indices_slice.ptr)[row]; break;
+            default: UNREACHABLE();
         }
-        if (v < 0 || static_cast<UInt64>(v) >= dict_size)
-            throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow IPC dictionary index {} out of range (size {})", v, dict_size);
-        /// A row of a non-nullable field may not point at a null entry: it would be a null row.
-        if (dictionary.null_entries && (*dictionary.null_entries)[v])
+        if (index < 0 || static_cast<UInt64>(index) >= dictionary_size)
+            throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow IPC dictionary index {} out of range (size {})", index, dictionary_size);
+
+        const size_t segment_index = has_constant_segments
+            ? static_cast<size_t>(std::upper_bound(dictionary.offsets.begin(), dictionary.offsets.end(), static_cast<size_t>(index))
+                - dictionary.offsets.begin())
+            : 0;
+        const size_t segment_start = segment_index == 0 ? 0 : dictionary.offsets[segment_index - 1];
+        const size_t index_in_segment = static_cast<size_t>(index) - segment_start;
+        const FieldDictionaryValues & segment = segments[segment_index];
+        if (segment.null_entries && segment.null_entries->getUInt(index_in_segment))
             throw Exception(
                 ErrorCodes::INCORRECT_DATA,
                 "Arrow IPC field '{}' is declared non-nullable but its row {} references null dictionary entry {}",
-                field.name, i, v);
-        idx[i] = static_cast<UInt64>(v);
+                field.name, row, index);
+
+        index_data[row] = has_constant_segments
+            ? key_starts[segment_index] + (isColumnConst(*segment.column) ? 0 : index_in_segment)
+            : static_cast<size_t>(index);
     }
 
-    /// Build the LowCardinality column directly from (keys, indexes): the dictionary is deduplicated
-    /// once (a handful of values) and the per-row indexes are remapped with a cheap gather — no
-    /// materialization of the full column and no per-row hashing. `decodeBatchColumn` reports the matching
-    /// LowCardinality type. A dictionary nested inside Array/Map/Tuple/Union is not wrapped as
-    /// LowCardinality by `fieldToCHType` (only top-level fields are), so materialize those to the plain
-    /// value column to keep the decoded column structure consistent with the declared type. For the rare
-    /// value type that cannot live inside LowCardinality, gather the full column too (the trailing NULL
-    /// key makes null rows resolve to NULL).
+    /// Top-level dictionary fields use `LowCardinality` when the value type supports it. Nested fields
+    /// and other value types gather the same compact keys into a plain column.
     if (allow_low_cardinality && value_type->canBeInsideLowCardinality())
     {
         auto low_cardinality_type = std::make_shared<DataTypeLowCardinality>(value_type);
@@ -1599,11 +1636,13 @@ ColumnPtr RecordBatchDecoder::decodeUnion(const ArrowField & field, size_t rows,
 
 ColumnPtr RecordBatchDecoder::decodeField(
     const ArrowField & field, bool allow_low_cardinality, const DataTypePtr & target_hint, const String & path,
-    size_t list_depth, const InvisibleRowsMask * invisible_rows)
+    size_t list_depth, const InvisibleRowsMask * invisible_rows, ColumnUInt8::Ptr * decoded_null_map)
 {
+    if (decoded_null_map)
+        *decoded_null_map = nullptr;
+
     const flatbuf::FieldNode & node = nextNode();
-    /// `FieldNode::length` is signed IPC metadata; reject a negative (corrupted) length before casting,
-    /// otherwise it would become a huge row count and drive oversized allocations.
+    /// Arrow lengths are signed and must be validated before conversion to a row count.
     const Int64 node_length = node.length();
     if (node_length < 0)
         throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow IPC field node has a negative length {}", node_length);
@@ -1612,22 +1651,15 @@ ColumnPtr RecordBatchDecoder::decodeField(
     if (invisible_rows && invisible_rows->size() != rows)
         invisible_rows = nullptr;
 
-    /// A dictionary-encoded field is physically an index array here (validity slot + indices); its value-type
-    /// layout (union, null, ...) lives only in the DictionaryBatch. Skip the value-type special cases below
-    /// for such a field so its index buffer is not misread as, e.g., a union type-id buffer; the
-    /// `field.dictionary` branch further down consumes the validity slot and the indices.
+    /// Dictionary fields store index validity and indices here; their value layout is in `DictionaryBatch`.
+    /// The value-type branches apply only to fields whose values are inline.
     const bool is_dictionary = field.dictionary.has_value();
 
     /// Unions have no validity buffer; handle them before consuming one.
     if (!is_dictionary && field.type.kind == TypeKind::Union)
     {
-        /// An Arrow union carries no top-level validity bitmap, so a node that nonetheless reports nulls is
-        /// malformed: there is no bitmap to say which rows are null, and `decodeUnion` would decode the
-        /// type-id/value buffers as if every row were valid. Reject a non-zero (or unknown, i.e. negative)
-        /// null count. Real `Variant` nulls travel through the explicit `null` child /
-        /// `ColumnVariant::NULL_DISCRIMINATOR`, not a FieldNode null count. An inherited invisible-rows
-        /// mask does propagate: rows it marks have undefined type-id/offset bytes and decode as Variant
-        /// NULL, and each child's visibility is the type-id selection narrowed by it (see `decodeUnion`).
+        /// Union nulls use an explicit `null` child, so the `FieldNode` must declare zero nulls.
+        /// Inherited invisible rows still propagate through the selected children in `decodeUnion`.
         if (node.null_count() != 0)
             throw Exception(
                 ErrorCodes::INCORRECT_DATA,
@@ -1636,66 +1668,45 @@ ColumnPtr RecordBatchDecoder::decodeField(
         return decodeUnion(field, rows, invisible_rows);
     }
 
-    /// An Arrow `null`-typed field carries no buffers at all (not even validity); it is an all-null
-    /// column. Decode it as an all-null `Nullable(Nothing)` (matching `fieldToCHType` and how the library
-    /// reader wraps its `Nothing` column); `buildChunk` then casts it to the requested target as NULLs
-    /// (or column DEFAULTs with `null_as_default`).
+    /// An Arrow `null` field has no buffers and maps to an all-null `Nullable(Nothing)` column.
     if (!is_dictionary && field.type.kind == TypeKind::Null)
-        return ColumnNullable::create(ColumnNothing::create(rows), ColumnUInt8::create(rows, UInt8{1}));
+    {
+        ColumnUInt8::Ptr null_map = ColumnUInt8::create(rows, UInt8{1});
+        if (decoded_null_map)
+            *decoded_null_map = null_map;
+        return ColumnNullable::create(ColumnNothing::create(rows), null_map);
+    }
 
     /// Every nullable-capable node carries a validity buffer slot first, then its value buffers.
     const Slice validity = nextBuffer();
 
-    /// A non-nullable field must not declare nulls. We build no null map for non-nullable fields (and
-    /// Array/Tuple/Map drop their outer validity), so a non-zero (or unknown, i.e. negative) FieldNode
-    /// null count would otherwise let those null rows be decoded silently as whatever is in the value
-    /// buffer. Reject it before reading values; this also guards the dictionary branch below.
+    /// A non-nullable field must declare a zero null count.
     if (!field.nullable && node.null_count() != 0)
         throw Exception(
             ErrorCodes::INCORRECT_DATA,
             "Arrow IPC field '{}' is declared non-nullable but its FieldNode reports {} nulls",
             field.name, node.null_count());
 
-    /// Validate the validity buffer against the declared row count whenever the field declares nulls,
-    /// before decoding the value buffers — even when the resulting column type drops the null map
-    /// (Array/Tuple/Map cannot be `Nullable` in ClickHouse, so their outer validity is not built). A
-    /// non-zero (or unknown, i.e. negative) null count needs a bitmap to say which rows are null: an
-    /// absent (zero-length) validity buffer would otherwise be treated as all-valid and silently turn the
-    /// declared nulls into real values. A present bitmap must also be large enough for the row count (a
-    /// too-small or forged-huge length would read past the buffer or drive an oversized allocation).
-    if (node.null_count() != 0)
-    {
-        if (validity.length == 0)
-            throw Exception(
-                ErrorCodes::INCORRECT_DATA,
-                "Arrow IPC field '{}' declares {} nulls but carries no validity bitmap",
-                field.name, node.null_count());
-        checkBufferSize(validity, (rows + 7) / 8, "validity");
-    }
-
-    /// Rows that are null at this level are also "invisible": the Arrow spec leaves the value bytes of a
-    /// null slot undefined, so value-level validation below must skip them (and decode them as type
-    /// defaults).
-    ColumnPtr own_null_map;
+    /// Null rows have undefined value bytes and join the inherited invisible rows before value decoding.
+    ColumnUInt8::Ptr own_null_map;
     InvisibleRowsMask composed_invisible;
     const InvisibleRowsMask * effective_invisible = invisible_rows;
     if (node.null_count() != 0)
     {
         own_null_map = buildNullMap(validity, rows, node.null_count());
-        effective_invisible = unionNullMaps(
-            assert_cast<const ColumnUInt8 &>(*own_null_map).getData(), invisible_rows, composed_invisible);
+        effective_invisible = unionNullMaps(own_null_map->getData(), invisible_rows, composed_invisible);
+        if (decoded_null_map)
+            *decoded_null_map = own_null_map;
     }
 
-    /// Dictionary-encoded fields carry indices here; the values come from a separate DictionaryBatch,
-    /// decoded for this field's position. The field's own nulls travel via `effective_invisible` (composed
-    /// above from the same validity).
+    /// Dictionary values come from separate batches; `effective_invisible` controls index visibility.
     if (field.dictionary)
         return decodeDictionary(field, rows, allow_low_cardinality, effective_invisible, path, list_depth);
 
     ColumnPtr inner = decodeInner(field, rows, target_hint, path, list_depth, effective_invisible);
     if (wrapsInNullable(field, *inner, resolveTargetHint(target_hint, path, list_depth)))
     {
-        ColumnPtr null_map = own_null_map ? own_null_map : buildNullMap(validity, rows, node.null_count());
+        ColumnUInt8::Ptr null_map = own_null_map ? own_null_map : buildNullMap(validity, rows, node.null_count());
         return ColumnNullable::create(inner, null_map);
     }
     return inner;
@@ -1866,14 +1877,18 @@ RecordBatchDecoder::DecodedColumns RecordBatchDecoder::decodeBatch(
     return result;
 }
 
-RecordBatchDecoder::DecodedColumn RecordBatchDecoder::decodeDictionaryValues(
+DictionaryRegistry::Values RecordBatchDecoder::decodeDictionaryValues(
     const flatbuf::RecordBatch & batch, const PODArray<char> & body, const ArrowField & value_field, const DictionaryUse & use,
     const UnorderedMapWithMemoryTracking<String, DataTypePtr> * target_types_)
 {
     beginBatch(batch, body, /*reachable_buffers=*/nullptr, target_types_);
-    DecodedColumn values = decodeBatchColumn(value_field, use.hint, use.position.path, use.position.list_depth);
+    ColumnUInt8::Ptr null_map;
+    DecodedColumn values = decodeBatchColumn(value_field, use.hint, use.position.path, use.position.list_depth, &null_map);
     finishBatch();
-    return values;
+    ColumnPtr dictionary_null_map = std::move(null_map);
+    if (dictionary_null_map && isColumnConst(*values.column))
+        dictionary_null_map = ColumnConst::create(dictionary_null_map, values.column->size());
+    return {std::move(values.column), std::move(values.type), std::move(dictionary_null_map)};
 }
 
 void RecordBatchDecoder::beginBatch(
@@ -1910,7 +1925,8 @@ void RecordBatchDecoder::beginBatch(
 }
 
 RecordBatchDecoder::DecodedColumn RecordBatchDecoder::decodeBatchColumn(
-    const ArrowField & field, const DataTypePtr & target_hint, const String & path, size_t list_depth)
+    const ArrowField & field, const DataTypePtr & target_hint, const String & path, size_t list_depth,
+    ColumnUInt8::Ptr * decoded_null_map)
 {
     /// Every column of a batch must decode to the batch's row count; otherwise the returned `Chunk` would
     /// mix columns of different sizes (an internal inconsistency) instead of being rejected as bad data.
@@ -1932,8 +1948,9 @@ RecordBatchDecoder::DecodedColumn RecordBatchDecoder::decodeBatchColumn(
     /// rather than by its natural type; a top-level field decodes into a LowCardinality column of that type.
     if (field.dictionary)
     {
-        decoded.type
-            = dictionaryValuesFor(field, registry.get(field.dictionary->id, FieldPosition{path, list_depth})).type;
+        const auto & dictionary = registry.get(field.dictionary->id, FieldPosition{path, list_depth});
+        const DataTypePtr & value_type = dictionary.segments.front().type;
+        decoded.type = field.nullable ? value_type : removeNullable(value_type);
         if (decoded.type->canBeInsideLowCardinality())
             decoded.type = std::make_shared<DataTypeLowCardinality>(decoded.type);
     }
@@ -1945,7 +1962,8 @@ RecordBatchDecoder::DecodedColumn RecordBatchDecoder::decodeBatchColumn(
         target_hint,
         path,
         list_depth,
-        /*invisible_rows=*/nullptr /*a batch column has no ancestors*/);
+        /*invisible_rows=*/nullptr,
+        decoded_null_map);
     /// `decodeField` may wrap a struct in Nullable based on the requested type hint even when
     /// `fieldToCHType` did not (setting off); reconcile the reported type with the decoded column so the
     /// column/type pair stays consistent for the subsequent cast.

@@ -48,35 +48,46 @@ using DictionaryUses = VectorWithMemoryTracking<DictionaryUse>;
 class DictionaryRegistry
 {
 public:
-    /// A dictionary's values and the type describing them. The type is not always the value field's
-    /// natural type: the values are decoded as the field encoding them would decode them inline (a `date32`
-    /// under a numeric target holds raw day numbers, binary under an IPv6 / big-integer target is already
-    /// reinterpreted), so the decoder builds `LowCardinality` columns from this pair instead of re-deriving
-    /// the type from the field. The values are decoded as a nullable array whatever the fields encoding them
-    /// declare (see `ArrowIPCBlockInputFormat::collectDictionaryFields`); a field applies its own nullability
-    /// when it materializes them. Fields sharing a dictionary id may request different types, so a dictionary
-    /// is decoded once per position of a field encoding it and stored per position (see
-    /// `RecordBatchDecoder::collectDictionaryUses`).
+    /// Each dictionary use stores its decoded values and their resulting ClickHouse type. Requested hints
+    /// affect the value representation, so fields sharing a dictionary id are decoded and stored separately
+    /// for each requested position. Dictionary entries may be null regardless of the referencing field's
+    /// nullability; each field applies its own nullability when materializing these values.
     struct Values
     {
         ColumnPtr column;
         DataTypePtr type;
+        /// The value array's null map is preserved when `Array`, `Map`, or plain `Tuple` drops its outer
+        /// nullability. Constant maps stay compact; a missing map denotes all-valid entries.
+        ColumnPtr null_map;
+    };
+
+    /// Adjacent ordinary batches share one segment for direct index lookup. Each constant batch retains
+    /// its own segment. `offsets` contains the cumulative logical row count at the end of each segment.
+    struct Dictionary
+    {
+        VectorWithMemoryTracking<Values> segments;
+        VectorWithMemoryTracking<size_t> offsets;
+
+        size_t size() const
+        {
+            return offsets.back();
+        }
     };
 
     /// Replaces (or, for delta batches, appends to) the values of dictionary `id` decoded for the field at
     /// `position`. A delta batch is decoded for the same positions as its base and must decode to the same
-    /// column layout there, so that its values can be appended to the registered column.
-    void set(Int64 id, const FieldPosition & position, ColumnPtr column, DataTypePtr type, bool is_delta);
-    const Values & get(Int64 id, const FieldPosition & position) const;
+    /// column layout there, so referenced values can be gathered into a common output column.
+    void set(Int64 id, const FieldPosition & position, Values values, bool is_delta);
+    const Dictionary & get(Int64 id, const FieldPosition & position) const;
     /// Drops all dictionaries (used when an `IInputFormat` is reset to read another stream).
     void clear() { dictionaries.clear(); }
 
 private:
     /// The decodings of one dictionary, keyed by `positionKey`.
-    using ValuesByPosition = UnorderedMapWithMemoryTracking<String, Values>;
+    using DictionariesByPosition = UnorderedMapWithMemoryTracking<String, Dictionary>;
     static String positionKey(const FieldPosition & position);
 
-    UnorderedMapWithMemoryTracking<Int64, ValuesByPosition> dictionaries;
+    UnorderedMapWithMemoryTracking<Int64, DictionariesByPosition> dictionaries;
 };
 
 /// Rows whose values are semantically absent: null at this or an ancestor level, in a list range no
@@ -183,13 +194,10 @@ public:
         const UnorderedMapWithMemoryTracking<String, DataTypePtr> * target_types = nullptr,
         const VectorWithMemoryTracking<char> * reachable_buffers = nullptr);
 
-    /// Decodes the single value column of a `DictionaryBatch` — `value_field` describes the dictionary's
-    /// value type — as the field encoding the dictionary decodes it inline: at that field's position, under
-    /// the requested type hint it resolves there (`use`, see `collectDictionaryUses`), with `target_types_`
-    /// to look requested subcolumn types up below it. A `date32` under a numeric target is thus read as the
-    /// raw day number, a binary leaf under an IPv6 / big-integer target is reinterpreted, and a dotted
-    /// request like `n.d` below the field resolves exactly as it does for inline values.
-    DecodedColumn decodeDictionaryValues(
+    /// Decodes a `DictionaryBatch` value column at the referencing field's position and requested type
+    /// hint (`use`), following the same rules as inline values. `target_types_` supplies requested subcolumn
+    /// types. The returned null map preserves entry validity independently of the resulting column type.
+    DictionaryRegistry::Values decodeDictionaryValues(
         const flatbuf::RecordBatch & batch, const PODArray<char> & body, const ArrowField & value_field,
         const DictionaryUse & use, const UnorderedMapWithMemoryTracking<String, DataTypePtr> * target_types_);
 
@@ -286,21 +294,19 @@ private:
     ColumnUInt64::MutablePtr decodeListOffsets(
         size_t rows, bool large, const char * what, const char * offsets_what, Int64 & base, Int64 & prev);
 
-    /// `allow_low_cardinality` is set only for top-level fields: a dictionary-encoded field decodes into
-    /// a LowCardinality column there, but a dictionary nested inside Array/Map/Tuple/Union is materialized
-    /// to its plain value column (matching the type `fieldToCHType` declares for the nested field).
-    /// `target_hint` is the requested ClickHouse type for this field, derived from the parent's hint as the
-    /// decoder recurses (and falling back to a `target_types` lookup by `path`, the dotted column name). It
-    /// only affects `date32`: when the hint resolves to a numeric or Decimal type the raw `Int32` day
-    /// number is read without the `Date32` range/overflow check, matching the library reader's numeric
-    /// type hint. `list_depth` counts the List/Map levels crossed on the way to this field (see
-    /// `resolveTargetHint`). `invisible_rows`, when non-null, is sized to this field's row count (see
-    /// `InvisibleRowsMask`); null maps and column types are built from each field's own declared validity
-    /// exactly as without a mask.
+    /// `allow_low_cardinality` lets top-level dictionary fields retain `LowCardinality`; nested dictionary
+    /// fields are materialized to their plain value column, matching `fieldToCHType`.
+    /// `target_hint` supplies the requested type inherited from the parent. `resolveTargetHint` uses it or
+    /// looks up the dotted `path` in `target_types`, accounting for the `List`/`Map` levels in `list_depth`.
+    /// The resolved hint guides numeric `date32` decoding, raw-byte reinterpretation, and struct nullability.
+    /// `invisible_rows`, when present, describes unobservable rows at this field's depth. The field's own
+    /// validity determines its null map and column type independently of this inherited mask.
+    /// `decoded_null_map`, when provided, receives that null map even when the column drops its `Nullable`
+    /// wrapper. A missing map denotes a field with no declared nulls.
     ColumnPtr decodeField(
         const ArrowField & field, bool allow_low_cardinality,
         const DataTypePtr & target_hint, const String & path, size_t list_depth,
-        const InvisibleRowsMask * invisible_rows);
+        const InvisibleRowsMask * invisible_rows, ColumnUInt8::Ptr * decoded_null_map = nullptr);
     /// Advances the node/buffer/variadic cursors over `field` exactly as `decodeField` would, without
     /// reading or materializing its data. Used to skip an unrequested top-level column while keeping the
     /// flat node/buffer cursors aligned for the columns that follow.
@@ -324,14 +330,10 @@ private:
     ColumnPtr decodeDictionary(
         const ArrowField & field, size_t rows, bool allow_low_cardinality, const InvisibleRowsMask * invisible_rows,
         const String & path, size_t list_depth);
-    ColumnPtr buildNullMap(const Slice & validity, size_t rows, Int64 null_count) const;
-    /// Whether the decoded column of a nullable field gets a Nullable wrapper. Array/Map cannot be inside
-    /// Nullable in ClickHouse, so (matching the Apache Arrow library reader) their outer validity is dropped.
-    /// A Struct (Tuple) is wrapped only when that is allowed: either `allow_experimental_nullable_tuple_type`
-    /// is on, or the requested type at this field (`effective_hint`) is already nullable, e.g. reading into
-    /// an existing `Nullable(Tuple)` column — mirroring the library reader's `allow_nullable_struct`.
-    /// Otherwise the struct is read as a plain Tuple, dropping the struct-level null map;
-    /// `decodeBatchColumn` reconciles the reported type to the column.
+    ColumnUInt8::Ptr buildNullMap(const Slice & validity, size_t rows, Int64 null_count) const;
+    /// Returns whether a nullable field retains a `Nullable` wrapper. `Array` and `Map` cannot retain one.
+    /// Struct fields also require `allow_experimental_nullable_tuple_type` or an explicitly nullable
+    /// requested type. `decodeBatchColumn` reconciles the reported type with the resulting column.
     bool wrapsInNullable(const ArrowField & field, const IColumn & inner, const DataTypePtr & effective_hint) const;
     ColumnPtr readOffsetsAndChild(
         const ArrowField & field, size_t rows, bool large, const DataTypePtr & target_hint, const String & path,
@@ -356,7 +358,8 @@ private:
     /// are the column's requested-type position (see `decodeField`): a record batch column sits at the top
     /// level, a dictionary's values at the position of the field encoding the dictionary.
     DecodedColumn decodeBatchColumn(
-        const ArrowField & field, const DataTypePtr & target_hint, const String & path, size_t list_depth);
+        const ArrowField & field, const DataTypePtr & target_hint, const String & path, size_t list_depth,
+        ColumnUInt8::Ptr * decoded_null_map = nullptr);
     /// Verifies that the batch's nodes, buffers and variadic counts were consumed exactly, then releases the
     /// per-batch state `beginBatch` set up.
     void finishBatch();

@@ -17,6 +17,7 @@
 #include <Core/ColumnWithTypeAndName.h>
 #include <Core/Block.h>
 #include <Columns/ColumnArray.h>
+#include <Columns/ColumnConst.h>
 #include <Columns/ColumnFixedString.h>
 #include <Columns/ColumnMap.h>
 #include <Columns/ColumnNullable.h>
@@ -329,35 +330,33 @@ ColumnWithTypeAndName realignStructFieldsToRequested(ColumnWithTypeAndName from,
     return from;
 }
 
-/// A LowCardinality dictionary must have unique values; the library reader rejects non-unique ones.
-/// Validate the common (non-nullable, contiguously-comparable) dictionary value columns.
-void checkDictionaryUnique(const ColumnPtr & values)
+/// Contiguous dictionary values must be unique across the base batch and all its deltas.
+void checkDictionaryUnique(const ArrowIPC::DictionaryRegistry::Dictionary & dictionary)
 {
-    const IColumn * inner = values.get();
-    const ColumnNullable * nullable = nullptr;
-    if (values->isNullable())
-    {
-        nullable = &assert_cast<const ColumnNullable &>(*values);
-        inner = &nullable->getNestedColumn();
-    }
-    /// Only validate value columns that can be compared cheaply and contiguously.
-    if (!(inner->isFixedAndContiguous() || typeid_cast<const ColumnString *>(inner)))
-        return;
-
     UnorderedSetWithMemoryTracking<std::string_view> seen;
-    seen.reserve(values->size());
     bool null_seen = false;
-    for (size_t i = 0; i < values->size(); ++i)
+    for (const auto & segment : dictionary.segments)
     {
-        if (nullable && nullable->getNullMapData()[i])
+        const auto * constant = typeid_cast<const ColumnConst *>(segment.column.get());
+        const IColumn & values = constant ? constant->getDataColumn() : *segment.column;
+        const auto * nullable = typeid_cast<const ColumnNullable *>(&values);
+        const IColumn & inner = nullable ? nullable->getNestedColumn() : values;
+        if (!(inner.isFixedAndContiguous() || typeid_cast<const ColumnString *>(&inner)))
+            return;
+
+        seen.reserve(seen.size() + values.size());
+        for (size_t i = 0; i < values.size(); ++i)
         {
-            if (null_seen)
+            if (nullable && nullable->getNullMapData()[i])
+            {
+                if (null_seen)
+                    throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow dictionary contains duplicate values");
+                null_seen = true;
+            }
+            else if (!seen.emplace(inner.getDataAt(i)).second)
+            {
                 throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow dictionary contains duplicate values");
-            null_seen = true;
-        }
-        else if (!seen.emplace(inner->getDataAt(i)).second)
-        {
-            throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow dictionary contains duplicate values");
+            }
         }
     }
 }
@@ -568,14 +567,8 @@ void ArrowIPCBlockInputFormat::decodeDictionaryBatch(
         if (use.hint)
             reinterpretRawByteColumns(values, use.hint);
 
-        checkDictionaryUnique(values.column);
-        dictionaries.set(id, use.position, values.column, values.type, dict_batch.isDelta());
-        /// A delta batch merges into the existing dictionary; re-validate the merged values. The per-batch
-        /// check above only proves the delta is internally unique, but a unique delta can still repeat a
-        /// value already present in the base dictionary, which would violate the LowCardinality dictionary
-        /// uniqueness invariant the non-delta path enforces.
-        if (dict_batch.isDelta())
-            checkDictionaryUnique(dictionaries.get(id, use.position).column);
+        dictionaries.set(id, use.position, {values.column, values.type, std::move(decoded.null_map)}, dict_batch.isDelta());
+        checkDictionaryUnique(dictionaries.get(id, use.position));
     }
 }
 
@@ -815,9 +808,12 @@ std::pair<ColumnPtr, DataTypePtr> reinterpretRawBytes(
 
 void ArrowIPCBlockInputFormat::reinterpretRawByteColumns(ColumnWithTypeAndName & column, const DataTypePtr & to_type) const
 {
+    const auto * constant = typeid_cast<const ColumnConst *>(column.column.get());
     auto [new_column, new_type] = reinterpretRawBytes(
-        column.column, column.type, to_type, /*ancestor_nulls=*/nullptr,
-        format_settings.arrow.case_insensitive_column_matching);
+        constant ? constant->getDataColumnPtr() : column.column, column.type, to_type,
+        /*ancestor_nulls=*/nullptr, format_settings.arrow.case_insensitive_column_matching);
+    if (constant)
+        new_column = ColumnConst::create(new_column, constant->size());
     column.column = std::move(new_column);
     column.type = std::move(new_type);
 }
