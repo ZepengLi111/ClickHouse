@@ -55,13 +55,6 @@ SELECT count() FROM
     GROUP BY k
 );
 
--- This event is incremented only from the new hook, on the thawed baseline spill path in
--- Aggregator::executeOnBlock, so it is what proves that path was taken. The two liveness
--- assertions below it are satisfiable by the pre-existing finish-time drain as well, and the part
--- bound is the oracle; this one pins the hook itself.
-SELECT 'shed the backlog on the thawed spill path',
-       sumIf(value, event = 'AdaptiveAggregationSpillBacklogSheds') > 0
-FROM system.events;
 -- Parts are written only once query memory crosses the external threshold, which is the condition
 -- the shedding is guarded by, so this is what proves the baseline spill decision was reached.
 SELECT 'went external', sumIf(value, event = 'ExternalAggregationWritePart') > 0 FROM system.events;
@@ -75,4 +68,29 @@ FROM system.events;
 -- the frozen path, whose shedding is not what this covers.
 SELECT 'thawed onto the baseline path', sumIf(value, event = 'AdaptiveAggregationThaws') > 0 FROM system.events;
 SELECT 'swept under pressure', sumIf(value, event = 'AdaptiveAggregationPressureSweeps') > 0 FROM system.events;
+
+-- The part bound above needs the shedding to be rare, because every crossing of the threshold
+-- writes one part, and a shape that crosses often puts the two arms' part counts on top of each
+-- other. The hook's own observable needs the opposite: where the crossing happens only in the first
+-- blocks after the thaw, one missed crossing leaves the counter at zero for the whole run. So it is
+-- asserted over a second query, at a quarter of the threshold, where the crossing recurs on most
+-- blocks instead: measured here the hook is taken 44-52 times per run against 3-4 above. The stream
+-- is halved because this query bounds nothing and only has to reach the hook, and it peaks lower
+-- than the first one.
+SET max_bytes_before_external_group_by = 16000000;
+
+SELECT 'liveness stream', count() FROM
+(
+    SELECT concat(toString(number % 100000), repeat('x', 60)) AS k
+    FROM numbers_mt(2000000)
+    GROUP BY k
+);
+
+-- This event is incremented only from the new hook, on the thawed baseline spill path in
+-- Aggregator::executeOnBlock, so it is what proves that path was taken. The liveness assertions
+-- above are satisfiable by the pre-existing finish-time drain as well, and the part bound is the
+-- oracle; this one pins the hook itself.
+SELECT 'shed the backlog on the thawed spill path',
+       sumIf(value, event = 'AdaptiveAggregationSpillBacklogSheds') > 0
+FROM system.events;
 "
