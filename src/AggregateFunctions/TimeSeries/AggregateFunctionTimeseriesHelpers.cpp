@@ -1260,7 +1260,7 @@ The samples can be passed in one of three forms:
 If several samples have the same timestamp, only one of them is used: the sample with the greatest value. A NaN value loses to any other value, so a NaN value is used only if all samples at this timestamp are NaN.
 
 :::warning
-This function is experimental, enable it by setting `allow_experimental_time_series_aggregate_functions=true`.
+This function is in private preview, enable it by setting `enable_time_series_aggregate_functions=true`.
 :::
     )";
     FunctionDocumentation::Syntax syntax_timeSeriesSumToGrid = R"(
@@ -1283,7 +1283,7 @@ timeSeriesSumToGrid(start_timestamp, end_timestamp, grid_step, staleness)(sample
     {
         "Basic usage with individual timestamp-value pairs",
         R"(
-SET allow_experimental_time_series_aggregate_functions = 1;
+SET enable_time_series_aggregate_functions = 1;
 WITH
     -- NOTE: the gap between 140 and 190 is to show how values are filled for ts = 150, 165, 180 according to window parameter
     [110, 120, 130, 140, 190, 200, 210, 220, 230]::Array(DateTime) AS timestamps,
@@ -1311,7 +1311,7 @@ FROM
     {
         "Using array arguments",
         R"(
-SET allow_experimental_time_series_aggregate_functions = 1;
+SET enable_time_series_aggregate_functions = 1;
 WITH
     [110, 120, 130, 140, 190, 200, 210, 220, 230]::Array(DateTime) AS timestamps,
     [1, 1, 3, 4, 5, 5, 8, 12, 13]::Array(Float32) AS values,
@@ -1356,7 +1356,7 @@ The samples can be passed in one of three forms:
 If several samples have the same timestamp, only one of them is used: the sample with the greatest value. A NaN value loses to any other value, so a NaN value is used only if all samples at this timestamp are NaN.
 
 :::warning
-This function is experimental, enable it by setting `allow_experimental_time_series_aggregate_functions=true`.
+This function is in private preview, enable it by setting `enable_time_series_aggregate_functions=true`.
 :::
     )";
     FunctionDocumentation::Syntax syntax_timeSeriesAvgToGrid = R"(
@@ -1379,7 +1379,7 @@ timeSeriesAvgToGrid(start_timestamp, end_timestamp, grid_step, staleness)(sample
     {
         "Basic usage with individual timestamp-value pairs",
         R"(
-SET allow_experimental_time_series_aggregate_functions = 1;
+SET enable_time_series_aggregate_functions = 1;
 WITH
     -- NOTE: the gap between 140 and 190 is to show how values are filled for ts = 150, 165, 180 according to window parameter
     [110, 120, 130, 140, 190, 200, 210, 220, 230]::Array(DateTime) AS timestamps,
@@ -1407,7 +1407,7 @@ FROM
     {
         "Using array arguments",
         R"(
-SET allow_experimental_time_series_aggregate_functions = 1;
+SET enable_time_series_aggregate_functions = 1;
 WITH
     [110, 120, 130, 140, 190, 200, 210, 220, 230]::Array(DateTime) AS timestamps,
     [1, 1, 3, 4, 5, 5, 8, 12, 13]::Array(Float32) AS values,
@@ -1452,7 +1452,7 @@ The samples can be passed in one of three forms:
 If several samples have the same timestamp, only one of them is used: the sample with the greatest value. A NaN value loses to any other value, so a NaN value is used only if all samples at this timestamp are NaN.
 
 :::warning
-This function is experimental, enable it by setting `allow_experimental_time_series_aggregate_functions=true`.
+This function is in private preview, enable it by setting `enable_time_series_aggregate_functions=true`.
 :::
     )";
     FunctionDocumentation::Syntax syntax_timeSeriesCountToGrid = R"(
@@ -1475,7 +1475,7 @@ timeSeriesCountToGrid(start_timestamp, end_timestamp, grid_step, staleness)(samp
     {
         "Basic usage with individual timestamp-value pairs",
         R"(
-SET allow_experimental_time_series_aggregate_functions = 1;
+SET enable_time_series_aggregate_functions = 1;
 WITH
     -- NOTE: the gap between 140 and 190 is to show how values are filled for ts = 150, 165, 180 according to window parameter
     [110, 120, 130, 140, 190, 200, 210, 220, 230]::Array(DateTime) AS timestamps,
@@ -1503,7 +1503,7 @@ FROM
     {
         "Using array arguments",
         R"(
-SET allow_experimental_time_series_aggregate_functions = 1;
+SET enable_time_series_aggregate_functions = 1;
 WITH
     [110, 120, 130, 140, 190, 200, 210, 220, 230]::Array(DateTime) AS timestamps,
     [1, 1, 3, 4, 5, 5, 8, 12, 13]::Array(Float32) AS values,
