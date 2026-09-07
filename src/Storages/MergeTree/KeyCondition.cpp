@@ -2104,152 +2104,92 @@ bool KeyCondition::extractDeterministicFunctionsDagFromKey(
 }
 
 
-/// `Field::isNaN` recognizes a scalar `Float64` only, so a NaN nested in a container is invisible to it.
-/// Iterative because Fields nest inside Fields and a recursive walk overflows the native stack.
-static bool fieldContainsNaNAnywhere(const Field & field)
+/// Materializes a transformed column and rejects a transformation that produced NULLs:
+/// - materialize output column (Const/LowCardinality)
+/// - reject if any NULLs were created as a result of transformation
+/// - strip Nullable/LowCardinality wrappers to get the actual column
+static bool finalizeTransformedColumn(ColumnPtr & column, DataTypePtr & type)
 {
-    absl::InlinedVector<const Field *, 16> pending{&field};
+    column = column->convertToFullIfWrapped()->convertToFullColumnIfLowCardinality();
+    type = removeLowCardinality(type);
 
-    while (!pending.empty())
+    if (column->isNullable())
     {
-        const Field * current = pending.back();
-        pending.pop_back();
-
-        if (isNaNField(*current))
-            return true;
-
-        switch (current->getType())
-        {
-            case Field::Types::Array:
-                for (const Field & element : current->safeGet<Array>())
-                    pending.push_back(&element);
-                break;
-            case Field::Types::Tuple:
-                for (const Field & element : current->safeGet<Tuple>())
-                    pending.push_back(&element);
-                break;
-            case Field::Types::Map:
-                for (const Field & element : current->safeGet<Map>())
-                    pending.push_back(&element);
-                break;
-            case Field::Types::Object:
-                for (const auto & [_, element] : current->safeGet<Object>())
-                    pending.push_back(&element);
-                break;
-            default:
-                break;
-        }
+        const auto & n = assert_cast<const ColumnNullable &>(*column);
+        for (char8_t b : n.getNullMapData())
+            if (b)
+                return false;
+        column = n.getNestedColumnPtr();
+        type = removeNullable(type);
     }
-
-    return false;
+    return true;
 }
 
 
-/// Applies a deterministic key-transform DAG to `in_column` and writes the transformed column/type to
-/// `out_column`/`out_type`.
-/// Intended for transforming constants (or IN-set elements) into "key space", so that the transformed
-/// values can be compared against key marks directly.
+/// Cast column to target_type and fail if the cast introduces NULLs.
+static bool castColumnWithoutNulls(ColumnPtr & column, DataTypePtr & type, const DataTypePtr & target_type)
+{
+    if (canBeSafelyCast(type, target_type))
+    {
+        column = castColumnAccurate({column, type, ""}, target_type);
+        type = target_type;
+        return true;
+    }
+
+    /// `castColumnAccurateOrNull` needs a target that can represent NULLs so a lossy cast is
+    /// observable. `LowCardinality` is only an encoding and is not itself nullable-able, so run
+    /// the accuracy probe against the `LowCardinality`-stripped target; otherwise a key column of
+    /// type `LowCardinality(FixedString)` (and similar) is wrongly rejected here, which silently
+    /// disables partition/key pruning. The requested `target_type` is re-applied afterwards so the
+    /// transform DAG still receives the type it was built against.
+    const DataTypePtr probe_type = removeLowCardinality(target_type);
+
+    /// `canBeInsideNullable` answers for the outer type only, so a `Tuple` holding an `Array`
+    /// passes it and then throws in the cast below.
+    if ((!probe_type->isNullable() && !probe_type->canBeInsideNullable())
+        || !canBeAccurateCastOrNullTarget(probe_type))
+    {
+        /// We cannot apply castColumnAccurateOrNull() because it will throw exception
+        return false;
+    }
+
+    ColumnPtr probe_column = castColumnAccurateOrNull({column, type, ""}, probe_type);
+    const auto & n = assert_cast<const ColumnNullable &>(*probe_column);
+
+    /// If we have any NULLs after cast, that means cast could not be applied accurately for all values
+    for (char8_t b : n.getNullMapData())
+        if (b)
+            return false;
+
+    /// No NULLs were introduced, so the cast is accurate for every value. Produce the requested
+    /// target_type (which may be LowCardinality and/or Nullable); the accurate cast cannot throw
+    /// here because the probe above already proved every value fits.
+    column = castColumnAccurate({column, type, ""}, target_type);
+    type = target_type;
+    return true;
+}
+
+
+/// Converts `in_column` to the type the transform DAG consumes and writes it to `out_column`/`out_type`,
+/// so the value the transform will see is observable before the transform runs.
+/// Returns false when the conversion cannot be applied accurately to every value in `in_column`.
 ///
-/// The function is intentionally conservative and returns false if the transformation cannot be proven
-/// safe for all values in `in_column`. In particular, it will fail if:
-/// - A required type conversion cannot be applied accurately for all values (casts that would produce NULLs).
-/// - Executing the DAG throws for some value from `in_column`.
-/// - The output contains NULLs (Nullable output is allowed only if it contains no NULLs; it is then unwrapped).
-///
-/// If `in_type` differs from `dag.input_type`, we normally cast `in_column` to `dag.input_type` (without
-/// introducing NULLs) and then execute the DAG. However, if the extracted DAG is just a single CAST applied
-/// directly to the input, casting to `dag.input_type` first can be redundant or even unsafe. In this case,
-/// we try to apply the CAST directly to the input column to avoid a lossy round-trip through `dag.input_type`
-/// (e.g. String -> Dynamic -> String).
-///
-/// Examples:
-/// - DAG `p -> cityHash64(p)`:
-///   input:  `['abc']`  type `String`
-///   output: `[cityHash64('abc')]`  type `UInt64`
-/// - DAG `p -> CAST(p, 'UInt8')`:
-///   input:  `['123']`  type `String`
-///   output: `[123]`  type `UInt8`
-///
-/// `out_transform_input_has_nan`, when given, is always written and reports whether the value handed to
-/// the transform DAG held a NaN. The direct-CAST fast path runs no DAG, so it reports false.
-static bool applyDeterministicDagToColumn(
+/// `out_transform_applied` reports the direct-CAST fast path: the DAG's only work was a CAST on the input
+/// and this function applied it, so `out_column`/`out_type` are already the transform's output and
+/// `executeDeterministicDag` must not be run on them.
+static bool convertColumnForDeterministicDag(
     const ColumnPtr & in_column,
     const DataTypePtr & in_type,
     const String & input_name,
     const DeterministicKeyTransformDag & dag,
     ColumnPtr & out_column,
     DataTypePtr & out_type,
-    bool * out_transform_input_has_nan = nullptr)
+    bool & out_transform_applied)
 {
-    if (out_transform_input_has_nan)
-        *out_transform_input_has_nan = false;
+    out_transform_applied = false;
 
     ColumnPtr input_column = in_column->convertToFullIfWrapped()->convertToFullColumnIfLowCardinality();
     DataTypePtr input_type = removeLowCardinality(in_type);
-
-    /// This is the final check for the output column after DAG execution:
-    /// - materialize output column (Const/LowCardinality)
-    /// - reject if any NULLs were created as a result of transformation
-    /// - strip Nullable/LowCardinality wrappers to get the actual column
-    auto finalize_output_column_and_type = [&](ColumnPtr & column, DataTypePtr & type) -> bool
-    {
-        column = column->convertToFullIfWrapped()->convertToFullColumnIfLowCardinality();
-        type = removeLowCardinality(type);
-
-        if (column->isNullable())
-        {
-            const auto & n = assert_cast<const ColumnNullable &>(*column);
-            for (char8_t b : n.getNullMapData())
-                if (b)
-                    return false;
-            column = n.getNestedColumnPtr();
-            type = removeNullable(type);
-        }
-        return true;
-    };
-
-    /// Cast column to target_type and fail if the cast introduces NULLs.
-    auto cast_without_nulls = [&](ColumnPtr & column, DataTypePtr & type, const DataTypePtr & target_type) -> bool
-    {
-        if (canBeSafelyCast(type, target_type))
-        {
-            column = castColumnAccurate({column, type, ""}, target_type);
-            type = target_type;
-            return true;
-        }
-
-        /// `castColumnAccurateOrNull` needs a target that can represent NULLs so a lossy cast is
-        /// observable. `LowCardinality` is only an encoding and is not itself nullable-able, so run
-        /// the accuracy probe against the `LowCardinality`-stripped target; otherwise a key column of
-        /// type `LowCardinality(FixedString)` (and similar) is wrongly rejected here, which silently
-        /// disables partition/key pruning. The requested `target_type` is re-applied afterwards so the
-        /// transform DAG still receives the type it was built against.
-        const DataTypePtr probe_type = removeLowCardinality(target_type);
-
-        /// `canBeInsideNullable` answers for the outer type only, so a `Tuple` holding an `Array`
-        /// passes it and then throws in the cast below.
-        if ((!probe_type->isNullable() && !probe_type->canBeInsideNullable())
-            || !canBeAccurateCastOrNullTarget(probe_type))
-        {
-            /// We cannot apply castColumnAccurateOrNull() because it will throw exception
-            return false;
-        }
-
-        ColumnPtr probe_column = castColumnAccurateOrNull({column, type, ""}, probe_type);
-        const auto & n = assert_cast<const ColumnNullable &>(*probe_column);
-
-        /// If we have any NULLs after cast, that means cast could not be applied accurately for all values
-        for (char8_t b : n.getNullMapData())
-            if (b)
-                return false;
-
-        /// No NULLs were introduced, so the cast is accurate for every value. Produce the requested
-        /// target_type (which may be LowCardinality and/or Nullable); the accurate cast cannot throw
-        /// here because the probe above already proved every value fits.
-        column = castColumnAccurate({column, type, ""}, target_type);
-        type = target_type;
-        return true;
-    };
 
     if (!input_type->equals(*dag.input_type))
     {
@@ -2305,27 +2245,40 @@ static bool applyDeterministicDagToColumn(
             out_column = input_column;
             out_type = input_type;
 
-            if (!input_type->equals(*cast_result_type) && !cast_without_nulls(out_column, out_type, cast_result_type))
+            if (!input_type->equals(*cast_result_type) && !castColumnWithoutNulls(out_column, out_type, cast_result_type))
                 return false;
 
-            return finalize_output_column_and_type(out_column, out_type);
+            return finalizeTransformedColumn(out_column, out_type);
         };
 
         if (try_apply_direct_cast_fast_path())
+        {
+            out_transform_applied = true;
             return true;
+        }
 
-        if (!cast_without_nulls(input_column, input_type, dag.input_type))
+        if (!castColumnWithoutNulls(input_column, input_type, dag.input_type))
             return false;
     }
 
-    if (out_transform_input_has_nan)
-    {
-        for (size_t i = 0, size = input_column->size(); i < size && !*out_transform_input_has_nan; ++i)
-            *out_transform_input_has_nan = fieldContainsNaNAnywhere((*input_column)[i]);
-    }
+    out_column = input_column;
+    out_type = input_type;
+    return true;
+}
 
+
+/// Executes the transform DAG on a column already converted by `convertColumnForDeterministicDag` and
+/// writes the transformed column/type to `out_column`/`out_type`.
+static bool executeDeterministicDag(
+    const DeterministicKeyTransformDag & dag,
+    const ColumnPtr & in_column,
+    const DataTypePtr & in_type,
+    const String & input_name,
+    ColumnPtr & out_column,
+    DataTypePtr & out_type)
+{
     Block block;
-    block.insert({input_column, input_type, input_name});
+    block.insert({in_column, in_type, input_name});
 
     /// This can throw. For example, `ORDER BY toUUID(p)` where p is String.
     /// Then,`WHERE p = 'not-a-uuid'` will throw. Maybe `CAST` function arguments could be checked earlier;
@@ -2343,7 +2296,58 @@ static bool applyDeterministicDagToColumn(
     const auto & res = block.getByName(dag.output_name);
     out_column = res.column;
     out_type = res.type;
-    return finalize_output_column_and_type(out_column, out_type);
+    return finalizeTransformedColumn(out_column, out_type);
+}
+
+
+/// Applies a deterministic key-transform DAG to `in_column` and writes the transformed column/type to
+/// `out_column`/`out_type`.
+/// Intended for transforming constants (or IN-set elements) into "key space", so that the transformed
+/// values can be compared against key marks directly.
+///
+/// The function is intentionally conservative and returns false if the transformation cannot be proven
+/// safe for all values in `in_column`. In particular, it will fail if:
+/// - A required type conversion cannot be applied accurately for all values (casts that would produce NULLs).
+/// - Executing the DAG throws for some value from `in_column`.
+/// - The output contains NULLs (Nullable output is allowed only if it contains no NULLs; it is then unwrapped).
+///
+/// If `in_type` differs from `dag.input_type`, we normally cast `in_column` to `dag.input_type` (without
+/// introducing NULLs) and then execute the DAG. However, if the extracted DAG is just a single CAST applied
+/// directly to the input, casting to `dag.input_type` first can be redundant or even unsafe. In this case,
+/// we try to apply the CAST directly to the input column to avoid a lossy round-trip through `dag.input_type`
+/// (e.g. String -> Dynamic -> String).
+///
+/// Examples:
+/// - DAG `p -> cityHash64(p)`:
+///   input:  `['abc']`  type `String`
+///   output: `[cityHash64('abc')]`  type `UInt64`
+/// - DAG `p -> CAST(p, 'UInt8')`:
+///   input:  `['123']`  type `String`
+///   output: `[123]`  type `UInt8`
+static bool applyDeterministicDagToColumn(
+    const ColumnPtr & in_column,
+    const DataTypePtr & in_type,
+    const String & input_name,
+    const DeterministicKeyTransformDag & dag,
+    ColumnPtr & out_column,
+    DataTypePtr & out_type)
+{
+    ColumnPtr transform_input_column;
+    DataTypePtr transform_input_type;
+    bool transform_applied = false;
+
+    if (!convertColumnForDeterministicDag(
+            in_column, in_type, input_name, dag, transform_input_column, transform_input_type, transform_applied))
+        return false;
+
+    if (transform_applied)
+    {
+        out_column = transform_input_column;
+        out_type = transform_input_type;
+        return true;
+    }
+
+    return executeDeterministicDag(dag, transform_input_column, transform_input_type, input_name, out_column, out_type);
 }
 
 
@@ -2479,19 +2483,26 @@ bool KeyCondition::canConstantBeWrappedByDeterministicFunctions(
 
     ColumnPtr const_column = out_type->createColumnConst(1, out_value);
 
-    ColumnPtr transformed_const_column;
-    DataTypePtr transformed_const_type;
-    bool transform_input_has_nan = false;
-    bool constant_transformed = applyDeterministicDagToColumn(
-        const_column,
-        out_type,
-        expr_name,
-        dag,
-        transformed_const_column,
-        transformed_const_type,
-        &transform_input_has_nan);
+    /// Convert before transforming, so the value the transform consumes is observable here: normalizing
+    /// the constant to the type the key expression reads is where a `String` can become a NaN.
+    ColumnPtr transform_input_column;
+    DataTypePtr transform_input_type;
+    bool transform_applied = false;
+    if (!convertColumnForDeterministicDag(
+            const_column, out_type, expr_name, dag, transform_input_column, transform_input_type, transform_applied))
+        return false;
 
-    if (!constant_transformed)
+    /// The direct-CAST fast path converts and transforms in one step, so it produces no intermediate value
+    /// to check; a CAST is not injective, so an atom over it is not exact either way.
+    const bool transform_input_has_nan
+        = !transform_applied && anyFieldSatisfies((*transform_input_column)[0], isNaNField);
+
+    ColumnPtr transformed_const_column = transform_input_column;
+    DataTypePtr transformed_const_type = transform_input_type;
+
+    if (!transform_applied
+        && !executeDeterministicDag(
+            dag, transform_input_column, transform_input_type, expr_name, transformed_const_column, transformed_const_type))
         return false;
 
     /// The comparison reads the constant in the domain of the column the key expression consumes, where a
