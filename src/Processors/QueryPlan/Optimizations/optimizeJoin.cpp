@@ -1314,13 +1314,19 @@ static QueryPlan::Node chooseJoinOrder(QueryGraphBuilder query_graph_builder, Qu
             nodeStack.pop();
 
             auto join_operator = std::move(entry->join_operator);
-            /// Normally the whole reordered graph carries a single strictness (non-All graphs are
-            /// capped to one join), so we re-stamp it uniformly. With a conflict detector (CD-A/CD-C)
-            /// the graph may mix strictnesses (e.g. inner joins around a reordered semi/anti join),
-            /// and each entry already carries its own strictness from `buildPhysicalPlan` -- do not
-            /// overwrite it.
-            if (!optimization_settings.query_plan_optimize_join_order_use_conflict_detector_a
-                && !optimization_settings.query_plan_optimize_join_order_use_conflict_detector_c)
+            /// Re-stamp the graph's single strictness onto each reconstructed join. The sole exception
+            /// is a semi/anti join that a conflict detector (CD-A/CD-C) actually reordered: only then
+            /// does the graph mix strictnesses (inner joins around the reordered semi/anti join), with
+            /// each entry already carrying its own strictness from `buildPhysicalPlan`, so a uniform
+            /// re-stamp would corrupt it. This mirrors `cda_reorder_semi_anti` in
+            /// `optimizeJoinLogicalImpl` -- the exact condition under which per-entry strictness is
+            /// populated. Gating on the settings alone (the previous check) dropped ANY/SEMI/ANTI to
+            /// ALL whenever a detector was on but the reorder never happened: the default `greedy`
+            /// algorithm never consults a detector, and an ANY join is never reordered (it keeps the
+            /// size-2 cap and an All DP entry), yet both took the skip branch and lost their strictness.
+            const bool cd_reordered_semi_anti = conflictDetectorReordersSemiAnti(optimization_settings)
+                && (join_strictness == JoinStrictness::Semi || join_strictness == JoinStrictness::Anti);
+            if (!cd_reordered_semi_anti)
                 join_operator.strictness = join_strictness;
 
             /// The optimizer reconstructs an unconnected Inner pair (e.g. `INNER JOIN ... ON 1`,
