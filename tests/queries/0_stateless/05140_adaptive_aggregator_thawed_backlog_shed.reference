@@ -4,7 +4,11 @@ parts stay far below the block count	1
 thawed onto the baseline path	1
 swept under pressure	1
 liveness stream	100000
-shed the backlog on the thawed pressure path	1
+shed the backlog on the baseline pressure path	1
 single-level stream	100000
 thawed onto the baseline path	1
 shed the backlog without a two-level table	1
+mixed stream	1400000
+no thread thawed	1
+a producer gave up on freezing	1
+shed the backlog with no thaw	1

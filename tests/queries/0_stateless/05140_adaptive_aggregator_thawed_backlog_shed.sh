@@ -104,12 +104,12 @@ SELECT 'liveness stream', count() FROM
     GROUP BY k
 );
 
--- This event is incremented only from the new hook, on the thawed memory-pressure path in
+-- This event is incremented only from the new hook, on the baseline memory-pressure path in
 -- Aggregator::executeOnBlock, and only when the sweep it runs there took staged records out, so it
 -- proves a shed happened rather than that the trigger was reached. The liveness assertions above are
 -- satisfiable by the pre-existing finish-time drain as well, and the part bound is the oracle; this
 -- one pins the hook itself.
-SELECT 'shed the backlog on the thawed pressure path',
+SELECT 'shed the backlog on the baseline pressure path',
        sumIf(value, event = 'AdaptiveAggregationSpillBacklogSheds') > 0
 FROM system.events;
 "
@@ -146,6 +146,59 @@ SELECT 'single-level stream', count() FROM
 
 SELECT 'thawed onto the baseline path', sumIf(value, event = 'AdaptiveAggregationThaws') > 0 FROM system.events;
 SELECT 'shed the backlog without a two-level table',
+       sumIf(value, event = 'AdaptiveAggregationSpillBacklogSheds') > 0
+FROM system.events;
+"
+
+# The hook is gated on the baseline phase and not on the thaw that motivated it, because the backlog
+# is session-wide memory and whichever producer arrives at the spill trigger is the right one to shed
+# it. So it fires with no thaw at all, which is what this stream pins: one producer freezes and
+# stages a backlog, another gives up on freezing by the row rule - 16 times the freeze threshold in
+# rows while staying below it in keys - and, once the query crosses the external threshold, sheds the
+# frozen one's backlog from the baseline path. Narrowing the gate to the thaw verdict would leave
+# that backlog resident for the rest of the query, which is the same defect this pull request is
+# about; the event is therefore named after the baseline path rather than after the thaw.
+#
+# The two producers get their own key streams from the two `UNION ALL` branches, one stream each:
+#
+#  - the frozen one is distinct per row, so the staged sample is never repeat-dominated and the thaw
+#    cannot fire, and it stages about 32 MB of records - below the threshold, so no sweep of its own
+#    sheds them - and then ends, after which nothing but the hook can shed the backlog;
+#  - the other holds 10 keys over its first 100000 rows and therefore gives up after about 16000 of
+#    them, long before any memory pressure, and only then turns key-rich, so what carries the query
+#    over the threshold is a baseline table growing after the frozen producer is gone.
+#
+# Measured with this binary the hook sheds once and takes the whole backlog with it.
+#
+# A separate process again, so that the counters cannot be satisfied by the streams above.
+$CLICKHOUSE_LOCAL --query "
+SET max_threads = 2;
+SET max_block_size = 8192;
+SET enable_adaptive_aggregator = 1;
+SET adaptive_aggregator_freeze_threshold = 1000;
+SET adaptive_aggregator_freeze_threshold_bytes = 0;
+SET group_by_two_level_threshold = 1000;
+SET group_by_two_level_threshold_bytes = 1000000;
+SET max_bytes_before_external_group_by = 56000000;
+SET max_bytes_ratio_before_external_group_by = 0;
+SET max_memory_usage = 300000000;
+SET collect_hash_table_stats_during_aggregation = 0;
+
+SELECT 'mixed stream', count() FROM
+(
+    SELECT k, count() FROM
+    (
+        SELECT concat(toString(number), repeat('x', 60)) AS k FROM numbers(500000)
+        UNION ALL
+        SELECT concat(if(number < 100000, toString(number % 10), toString(number + 1000000000)), repeat('x', 60)) AS k
+        FROM numbers(1000000)
+    )
+    GROUP BY k
+);
+
+SELECT 'no thread thawed', sumIf(value, event = 'AdaptiveAggregationThaws') = 0 FROM system.events;
+SELECT 'a producer gave up on freezing', sumIf(value, event = 'AdaptiveAggregationGiveUps') > 0 FROM system.events;
+SELECT 'shed the backlog with no thaw',
        sumIf(value, event = 'AdaptiveAggregationSpillBacklogSheds') > 0
 FROM system.events;
 "

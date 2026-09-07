@@ -2464,14 +2464,21 @@ bool Aggregator::executeOnBlock(Columns columns,
         }
     }
 
-    /// A thawed producer keeps every record it staged before the thaw published for the merge,
-    /// and flushing its own table cannot free them, so left resident they hold the query over
-    /// the external threshold. The backlog is therefore shed under the same trigger the frozen
-    /// branch above uses, and like it before `checkLimits`: the freeze thresholds are far below
-    /// the two-level ones, so a thawed table can carry the whole backlog while still being
-    /// single-level and unspillable, and waiting for the conversion would leave it resident
-    /// across the limit checks. The `initialized` flag also reports that the shared drain table
-    /// the sweep routes into exists.
+    /// A producer the adaptive engine put back on the baseline path keeps every record it staged
+    /// while frozen published for the merge, and flushing its own table cannot free them, so left
+    /// resident they hold the query over the external threshold. The backlog is therefore shed
+    /// under the same trigger the frozen branch above uses, and like it before `checkLimits`: the
+    /// freeze thresholds are far below the two-level ones, so such a table can carry the whole
+    /// backlog while still being single-level and unspillable, and waiting for the conversion
+    /// would leave it resident across the limit checks. The `initialized` flag also reports that
+    /// the shared drain table the sweep routes into exists.
+    ///
+    /// The gate is the baseline phase itself and not the thaw that motivated it: the backlog is
+    /// session-wide memory, so whichever producer arrives at the spill trigger is the right one to
+    /// shed it, and a producer that stood down on its own - by the give-up rule above, or by the
+    /// pressure stand-down - sheds a frozen twin's backlog just as usefully. Narrowing this to
+    /// `RepeatedStagedKeys` would only make the query wait for a thaw, or for a frozen producer to
+    /// reach its own trigger, to free memory that already holds the query over the threshold.
     if (adaptive && adaptive->isBaseline() && params.max_bytes_before_external_group_by
         && current_memory_usage > static_cast<Int64>(params.max_bytes_before_external_group_by)
         && adaptive->session->initialized.load(std::memory_order_acquire))
