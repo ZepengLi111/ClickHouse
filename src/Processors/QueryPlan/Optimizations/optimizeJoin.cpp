@@ -1304,6 +1304,19 @@ static QueryPlan::Node chooseJoinOrder(QueryGraphBuilder query_graph_builder, Qu
         input_node_map[input] = input_idx;
     }
 
+    /// Decide once whether this graph's per-entry strictnesses are authoritative. `buildPhysicalPlan`
+    /// leaves every DP entry `All` except a semi/anti join that a conflict detector (CD-A/CD-C)
+    /// admitted while reordering, which carries its own strictness. If any entry carries a specific
+    /// (non-`All`) strictness the graph is mixed -- inner joins around a reordered semi/anti join,
+    /// which may be nested anywhere, even under an inner top join -- and each entry's own strictness
+    /// must be kept. Otherwise the graph is uniform and its single `join_strictness` must be stamped
+    /// onto the reconstructed joins (e.g. an ANY/SEMI/ANTI join that was only swapped, or the whole
+    /// graph under the default greedy algorithm, which never populates per-entry strictness).
+    bool graph_has_mixed_strictness = false;
+    for (const auto * seq_entry : sequence)
+        if (!seq_entry->isLeaf() && seq_entry->join_operator.strictness != JoinStrictness::All)
+            graph_has_mixed_strictness = true;
+
     for (size_t entry_idx = 0; entry_idx < sequence.size(); ++entry_idx)
     {
         auto * entry = sequence[entry_idx];
@@ -1324,19 +1337,9 @@ static QueryPlan::Node chooseJoinOrder(QueryGraphBuilder query_graph_builder, Qu
             nodeStack.pop();
 
             auto join_operator = std::move(entry->join_operator);
-            /// Re-stamp the graph's single strictness onto each reconstructed join. The sole exception
-            /// is a semi/anti join that a conflict detector (CD-A/CD-C) actually reordered: only then
-            /// does the graph mix strictnesses (inner joins around the reordered semi/anti join), with
-            /// each entry already carrying its own strictness from `buildPhysicalPlan`, so a uniform
-            /// re-stamp would corrupt it. This mirrors `cda_reorder_semi_anti` in
-            /// `optimizeJoinLogicalImpl` -- the exact condition under which per-entry strictness is
-            /// populated. Gating on the settings alone (the previous check) dropped ANY/SEMI/ANTI to
-            /// ALL whenever a detector was on but the reorder never happened: the default `greedy`
-            /// algorithm never consults a detector, and an ANY join is never reordered (it keeps the
-            /// size-2 cap and an All DP entry), yet both took the skip branch and lost their strictness.
-            const bool cd_reordered_semi_anti = conflictDetectorReordersSemiAnti(optimization_settings)
-                && (join_strictness == JoinStrictness::Semi || join_strictness == JoinStrictness::Anti);
-            if (!cd_reordered_semi_anti)
+            /// See `graph_has_mixed_strictness` above: keep each entry's own strictness in a mixed
+            /// graph, otherwise stamp the graph's single strictness.
+            if (!graph_has_mixed_strictness)
                 join_operator.strictness = join_strictness;
 
             /// The optimizer reconstructs an unconnected Inner pair (e.g. `INNER JOIN ... ON 1`,

@@ -39,3 +39,28 @@ SELECT 'ANTI dpsub  cd_c', count() FROM l LEFT ANTI JOIN r ON l.k = r.k
 
 DROP TABLE l;
 DROP TABLE r;
+
+-- A CD-reordered SEMI/ANTI join can be nested under an inner top join, not just at the top. The
+-- strictness re-stamp must not flatten such a nested join to a plain join (it did in an early version
+-- of the fix, turning LEFT ANTI into LEFT and multiplying rows). Here the top join is INNER, so its
+-- graph strictness is ALL, yet the nested SEMI/ANTI must keep its own strictness under dpsub + CD.
+DROP TABLE IF EXISTS a;
+DROP TABLE IF EXISTS b;
+DROP TABLE IF EXISTS c;
+CREATE TABLE a (k UInt64) ENGINE = MergeTree ORDER BY k;
+CREATE TABLE b (k UInt64) ENGINE = MergeTree ORDER BY k;
+CREATE TABLE c (k UInt64) ENGINE = MergeTree ORDER BY k;
+INSERT INTO a SELECT number FROM numbers(6);   -- 0,1,2,3,4,5
+INSERT INTO b VALUES (1), (3);
+INSERT INTO c VALUES (0), (1), (2), (4);
+
+-- a LEFT ANTI b -> {0,2,4,5}; INNER JOIN c ON a.k = c.k -> {0,2,4} = 3.
+SELECT 'nested ANTI dpsub cd_c', count() FROM a LEFT ANTI JOIN b ON a.k = b.k INNER JOIN c ON a.k = c.k
+    SETTINGS query_plan_optimize_join_order_algorithm = 'dpsub', query_plan_optimize_join_order_use_conflict_detector_c = 1;
+-- a LEFT SEMI b -> {1,3}; INNER JOIN c ON a.k = c.k -> {1} = 1.
+SELECT 'nested SEMI dpsub cd_a', count() FROM a LEFT SEMI JOIN b ON a.k = b.k INNER JOIN c ON a.k = c.k
+    SETTINGS query_plan_optimize_join_order_algorithm = 'dpsub', query_plan_optimize_join_order_use_conflict_detector_a = 1;
+
+DROP TABLE a;
+DROP TABLE b;
+DROP TABLE c;
