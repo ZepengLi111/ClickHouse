@@ -105,19 +105,15 @@ structure()
     esac
 }
 
-# The check each shape's forged length must trip at least once: the exact expected length for a
-# fixed-size-list child or a struct field (the struct shape can also trip the top-level batch-length
-# check, when the struct's own node is the patched one), and the physical body bound for a forged buffered
-# child of a map or list (the entries struct has a buffered key, the inner struct a buffered int32 field,
-# so neither is buffer-less). The buffer-less child of a list may declare any length past the referenced
-# rows, so the list shapes require no rejection.
+# Fixed-size-list children and struct fields must have the expected row counts before decoding.
+# This includes the entries struct of a map and the element struct of a list. Buffer-less list children
+# may retain unreferenced rows, so the list-of-null shapes do not require a length rejection.
 guard_pattern()
 {
     case "$1" in
-        fsl_null)                              echo "fixed-size-list child declares" ;;
-        struct_null)                           echo "declares .* rows, expected" ;;
-        map_string_null|list_struct_null_int)  echo "more than the .* message body can hold" ;;
-        *)                                     echo "" ;;
+        fsl_null)                                        echo "fixed-size-list child declares" ;;
+        struct_null|map_string_null|list_struct_null_int) echo "declares .* rows, expected" ;;
+        *)                                               echo "" ;;
     esac
 }
 
