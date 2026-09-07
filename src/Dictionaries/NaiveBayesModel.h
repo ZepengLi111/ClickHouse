@@ -474,8 +474,7 @@ public:
     /// arena) when it is not yet in the vocabulary.
     UInt32 getOrAssignNgramIndex(std::string_view ngram)
     {
-        auto hash_fn = StringViewHash{};
-        ArenaPackedStringHolder key_holder{PackedStringRef::build(ngram.data(), ngram.size(), hash_fn), key_arena};
+        ArenaPackedStringHolder key_holder{PackedStringRef::build(ngram.data(), ngram.size(), PackedStringRefHash{}), key_arena};
         NGramIndexMap::LookupResult it = nullptr;
         bool inserted = false;
         ngram_to_index.emplace(key_holder, it, inserted);
@@ -575,7 +574,7 @@ public:
         size_t matched_ngrams = 0;
         auto accumulate = [&](std::string_view ngram)
         {
-            auto key = PackedStringRef::build(ngram.data(), ngram.size(), StringViewHash{});
+            auto key = PackedStringRef::build(ngram.data(), ngram.size(), PackedStringRefHash{});
             auto it = ngram_to_index.find(key);
             if (!it)
                 return;

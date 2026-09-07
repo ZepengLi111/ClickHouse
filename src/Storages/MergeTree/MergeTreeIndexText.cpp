@@ -1682,7 +1682,7 @@ void MergeTreeIndexTextGranuleBuilder::seedDropFilter()
     for (const auto & filter_token : filter_tokens)
     {
         memcpy(data, filter_token.data(), filter_token.size());
-        auto key = PackedStringRef::build(data, filter_token.size(), StringViewHash{});
+        auto key = PackedStringRef::build(data, filter_token.size(), PackedStringRefHash{});
         data += filter_token.size();
 
         tokens_map.emplace(key, it, inserted);
@@ -1696,7 +1696,7 @@ void MergeTreeIndexTextGranuleBuilder::addToken(std::string_view token, UInt32 t
     bool inserted = false;
     TokenToPostingsBuilderMap::LookupResult it{};
 
-    auto packed_key = PackedStringRef::build(token.data(), token.size(), StringViewHash{});
+    auto packed_key = PackedStringRef::build(token.data(), token.size(), PackedStringRefHash{});
 
     if (postprocessor_drop_filter && !postprocessor_drop_filter->drop_on_match)
     {

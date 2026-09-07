@@ -24,12 +24,12 @@ TLDList::TLDList(size_t size)
 void TLDList::insert(const String & host, TLDType type)
 {
     std::string_view owned_host{memory_pool->insert(host.data(), host.size()), host.size()};
-    tld_container.insertIfNotPresent(PackedStringRef::build(owned_host.data(), owned_host.size(), StringViewHash{}), type);
+    tld_container.insertIfNotPresent(PackedStringRef::build(owned_host.data(), owned_host.size(), PackedStringRefHash{}), type);
 }
 
 TLDType TLDList::lookup(std::string_view host) const
 {
-    auto key = PackedStringRef::build(host.data(), host.size(), StringViewHash{});
+    auto key = PackedStringRef::build(host.data(), host.size(), PackedStringRefHash{});
     if (const auto * it = tld_container.find(key); it != nullptr)
         return it->getMapped();
     return TLDType::TLD_NONE;
