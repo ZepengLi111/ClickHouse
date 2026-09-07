@@ -6,7 +6,7 @@
 DROP TABLE IF EXISTS prometheus;
 
 SET session_timezone = 'UTC';
-SET enable_time_series_table = 1;
+SET allow_experimental_time_series_table = 1;
 
 CREATE TABLE prometheus ENGINE = TimeSeries;
 

@@ -1499,23 +1499,11 @@ using AliasMap = UnorderedMapWithMemoryTracking<std::string_view, std::string_vi
 #define SETTING_SKIP_TRAIT(...)
 
 
-/// Generates the alias mapping entries of a setting: one `{ alias, name }` pair per alias.
-/// A setting declared with `DECLARE_WITH_ALIAS` can list one or two aliases after its flags.
+/// Generates one or two alias mapping entries.
 /// NOLINTNEXTLINE
-#define DECLARE_SETTINGS_WITH_ALIAS_TRAITS_(TYPE, NAME, DEFAULT, DESCRIPTION, FLAGS, ...) \
-    SETTINGS_ALIAS_ENTRIES_(NAME, __VA_ARGS__)
-
-/// NOLINTNEXTLINE
-#define SETTINGS_ALIAS_ENTRY_(NAME, ALIAS) { #ALIAS, #NAME },
-/// NOLINTNEXTLINE
-#define SETTINGS_ALIAS_ENTRIES_1_(NAME, ALIAS1) SETTINGS_ALIAS_ENTRY_(NAME, ALIAS1)
-/// NOLINTNEXTLINE
-#define SETTINGS_ALIAS_ENTRIES_2_(NAME, ALIAS1, ALIAS2) SETTINGS_ALIAS_ENTRY_(NAME, ALIAS1) SETTINGS_ALIAS_ENTRY_(NAME, ALIAS2)
-/// NOLINTNEXTLINE
-#define SETTINGS_ALIAS_ENTRIES_SELECT_(_1, _2, MACRO, ...) MACRO
-/// NOLINTNEXTLINE
-#define SETTINGS_ALIAS_ENTRIES_(NAME, ...) \
-    SETTINGS_ALIAS_ENTRIES_SELECT_(__VA_ARGS__, SETTINGS_ALIAS_ENTRIES_2_, SETTINGS_ALIAS_ENTRIES_1_)(NAME, __VA_ARGS__)
+#define DECLARE_SETTINGS_WITH_ALIAS_TRAITS_(TYPE, NAME, DEFAULT, DESCRIPTION, FLAGS, ALIAS, ...) \
+    { #ALIAS, #NAME }, \
+    __VA_OPT__({ #__VA_ARGS__, #NAME },)
 
 /// Implement the full settings infrastructure for a settings class.
 /// Generates: Impl struct, Data constructor, Accessor singleton, and
