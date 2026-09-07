@@ -1334,9 +1334,24 @@ def local_master_track_commits(local_master_commits_to_check_for_build):
             "skipping local master-track commits"
         )
         return []
+    # merge-base may sit off master's first-parent chain (branch cut from a merge's 2nd parent); anchor on the newest master-first-parent commit at/below it.
+    anchor = merge_base
+    if not Shell.check(
+        f"git rev-list --first-parent -n 1000 {master_ref} | grep -q ^{merge_base}"
+    ):
+        anchor = Shell.get_output(
+            f"git rev-list --first-parent -n 1000 {master_ref} | "
+            f"while read c; do git merge-base --is-ancestor $c {merge_base} && echo $c && break; done"
+        ).strip()
+    if not anchor:
+        print(
+            "WARNING: no master-side ancestor below the merge-base; "
+            "skipping local master-track commits"
+        )
+        return []
     commits = Shell.get_output(
         f"git log --first-parent --format=%H -n {local_master_commits_to_check_for_build} "
-        f"{merge_base}"
+        f"{anchor}"
     ).split()
     # Drop first commit on the branch
     head = Shell.get_output("git rev-parse HEAD").strip()
