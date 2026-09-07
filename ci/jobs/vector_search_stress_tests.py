@@ -81,7 +81,7 @@ dataset_hackernews_openai = {
         url           String,
         title         String,
         text          String,
-        vector        Array(Float32)
+        vector        Array(BFloat16)  CODEC(NONE)
      """,
     ID_COLUMN: "id",
     VECTOR_COLUMN: "vector",
@@ -97,7 +97,7 @@ dataset_cohere_wiki_20m = {
     ],
     SCHEMA: """
         id            UInt32,
-        vector        Array(Float32)
+        vector        Array(BFloat16)  CODEC(NONE)
      """,
     ID_COLUMN: "id",
     VECTOR_COLUMN: "vector",
@@ -141,7 +141,7 @@ dataset_laion_5b_mini_for_quick_test = {
     ],
     SCHEMA: """
         id Int32,
-        vector Array(Float32)
+        vector Array(BFloat16)  CODEC(NONE)
      """,
     ID_COLUMN: "id",
     VECTOR_COLUMN: "vector",
