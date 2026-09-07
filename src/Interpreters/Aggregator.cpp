@@ -2476,9 +2476,11 @@ bool Aggregator::executeOnBlock(Columns columns,
         && current_memory_usage > static_cast<Int64>(params.max_bytes_before_external_group_by)
         && adaptive->session->initialized.load(std::memory_order_acquire))
     {
-        ProfileEvents::increment(ProfileEvents::AdaptiveAggregationSpillBacklogSheds);
         flushPendingChunks(*adaptive);
-        drainStagedChunksUnderMemoryPressure(*adaptive->session);
+        /// Every later block reaches this trigger too, with the backlog already down to what no
+        /// sweep writes, so the event counts the records taken out and not the arrivals here.
+        if (drainStagedChunksUnderMemoryPressure(*adaptive->session))
+            ProfileEvents::increment(ProfileEvents::AdaptiveAggregationSpillBacklogSheds);
     }
 
     bool worth_convert_to_two_level = worthConvertToTwoLevel(

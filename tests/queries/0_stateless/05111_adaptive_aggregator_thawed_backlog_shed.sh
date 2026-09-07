@@ -74,9 +74,12 @@ SELECT 'swept under pressure', sumIf(value, event = 'AdaptiveAggregationPressure
 # one part, and a shape that crosses often puts the two arms' part counts on top of each other. The
 # hook's own observable needs the opposite: where the crossing happens only in the first blocks after
 # the thaw, one missed crossing leaves the counter at zero for the whole run. So it is asserted over
-# a second stream, at a quarter of the threshold, where the crossing recurs on most blocks instead:
-# measured here the hook is taken 44-52 times per run against 3-4 above. The stream is halved because
-# this query bounds nothing and only has to reach the hook, and it peaks lower than the first one.
+# a second stream, at a quarter of the threshold, where the crossing recurs on most blocks and a
+# thawed producer therefore reaches the hook on the block it thaws on. The counter still lands at one
+# shed per producer, because the backlog is shed once and a later crossing finds it gone: measured
+# here it is exactly 2 in 23 runs of 23, sequential and eight at a time alike. The stream is halved
+# because this query bounds nothing and only has to reach the hook, and it peaks lower than the
+# first one.
 #
 # Its own process again: `system.events` is cumulative for the whole process, so run together with
 # the stream above this assertion would stay green whenever the hook fires only there, and it would
@@ -102,9 +105,10 @@ SELECT 'liveness stream', count() FROM
 );
 
 -- This event is incremented only from the new hook, on the thawed memory-pressure path in
--- Aggregator::executeOnBlock, so it is what proves that path was taken. The liveness assertions
--- above are satisfiable by the pre-existing finish-time drain as well, and the part bound is the
--- oracle; this one pins the hook itself.
+-- Aggregator::executeOnBlock, and only when the sweep it runs there took staged records out, so it
+-- proves a shed happened rather than that the trigger was reached. The liveness assertions above are
+-- satisfiable by the pre-existing finish-time drain as well, and the part bound is the oracle; this
+-- one pins the hook itself.
 SELECT 'shed the backlog on the thawed pressure path',
        sumIf(value, event = 'AdaptiveAggregationSpillBacklogSheds') > 0
 FROM system.events;
@@ -115,9 +119,9 @@ FROM system.events;
 # would leave the backlog resident across the limit checks, which is why the shedding hangs off the
 # memory-pressure trigger rather than off the spill branch. Here the conversion is put out of reach
 # entirely: the hook is the only thing that can shed after the thaw, and with it gated behind the
-# conversion nothing does - measured with this binary, the hook is taken 3-4 times per run, and with
-# it reverted the same query holds ~99 MiB and dies under a 100 MB limit in 2 runs out of 5. The
-# limit is left generous here because the assertion is the counter, not the peak.
+# conversion nothing does - measured with this binary, the hook sheds 3-4 times per run, and with it
+# reverted the same query holds ~99 MiB and dies under a 100 MB limit in 2 runs out of 5. The limit
+# is left generous here because the assertion is the counter, not the peak.
 #
 # A separate process again, so that the counter cannot be satisfied by the streams above.
 $CLICKHOUSE_LOCAL --query "
