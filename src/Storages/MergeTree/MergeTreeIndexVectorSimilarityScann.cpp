@@ -57,6 +57,8 @@
 #include <google/protobuf/text_format.h>
 #pragma GCC diagnostic pop
 
+#include <base/arithmeticOverflow.h>
+
 namespace DB
 {
 
@@ -683,6 +685,16 @@ void MergeTreeIndexGranuleVectorSimilarityScann::deserializeBinary(ReadBuffer & 
     UInt64 pd = 0;
     readIntBinary(n, istr);
     readIntBinary(pd, istr);
+
+    const UInt64 expected_padded_dim = computePaddedDim(params.dimensions);
+    if (pd != expected_padded_dim)
+        throw Exception(
+            ErrorCodes::INCORRECT_DATA,
+            "ScaNN index restore failed: persisted padded dimension {} does not match expected padded dimension {}. "
+            "Drop and recreate the index.",
+            pd,
+            expected_padded_dim);
+
     num_vectors = n;
     padded_dim = pd;
 
@@ -696,6 +708,15 @@ void MergeTreeIndexGranuleVectorSimilarityScann::deserializeBinary(ReadBuffer & 
             static_cast<UInt64>(index_state));
     if (index_state == static_cast<UInt8>(ScannIndexState::NoIndex))
         return;
+
+    size_t reorder_elements = 0;
+    if (common::mulOverflow(num_vectors, padded_dim, reorder_elements))
+        throw Exception(
+            ErrorCodes::INCORRECT_DATA,
+            "ScaNN index restore failed: persisted reorder dataset dimensions {} x {} overflow. "
+            "Drop and recreate the index.",
+            num_vectors,
+            padded_dim);
 
     /// Reorder vectors at the stored precision. The on-disk tag is authoritative (it must match
     /// how the artifacts were quantized), so set params.precision from it.
@@ -716,27 +737,63 @@ void MergeTreeIndexGranuleVectorSimilarityScann::deserializeBinary(ReadBuffer & 
     if (precision_tag == 0)
     {
         params.precision = "f32";
-        vectors.resize(num_vectors * padded_dim);
+        if (reorder_elements > vectors.max_size())
+            throw Exception(
+                ErrorCodes::INCORRECT_DATA,
+                "ScaNN index restore failed: persisted f32 reorder dataset dimensions {} x {} are too large. "
+                "Drop and recreate the index.",
+                num_vectors,
+                padded_dim);
+        vectors.resize(reorder_elements);
         istr.readStrict(reinterpret_cast<char *>(vectors.data()), vectors.size() * sizeof(float));
     }
     else if (precision_tag == 1)
     {
         params.precision = "bf16";
-        bf16_data.resize(num_vectors * padded_dim);
+        if (reorder_elements > bf16_data.max_size())
+            throw Exception(
+                ErrorCodes::INCORRECT_DATA,
+                "ScaNN index restore failed: persisted bf16 reorder dataset dimensions {} x {} are too large. "
+                "Drop and recreate the index.",
+                num_vectors,
+                padded_dim);
+        bf16_data.resize(reorder_elements);
         istr.readStrict(reinterpret_cast<char *>(bf16_data.data()), bf16_data.size() * sizeof(int16_t));
     }
     else if (precision_tag == 2)
     {
         params.precision = "i8";
-        int8_data.resize(num_vectors * padded_dim);
+        if (reorder_elements > int8_data.max_size())
+            throw Exception(
+                ErrorCodes::INCORRECT_DATA,
+                "ScaNN index restore failed: persisted i8 reorder dataset dimensions {} x {} are too large. "
+                "Drop and recreate the index.",
+                num_vectors,
+                padded_dim);
+        int8_data.resize(reorder_elements);
         istr.readStrict(reinterpret_cast<char *>(int8_data.data()), int8_data.size() * sizeof(int8_t));
         UInt64 mult_len = 0;
         readIntBinary(mult_len, istr);
+        if (mult_len != padded_dim)
+            throw Exception(
+                ErrorCodes::INCORRECT_DATA,
+                "ScaNN index restore failed: persisted i8 multiplier count {} does not match padded dimension {}. "
+                "Drop and recreate the index.",
+                mult_len,
+                padded_dim);
         int8_multipliers.resize(mult_len);
         if (mult_len > 0)
             istr.readStrict(reinterpret_cast<char *>(int8_multipliers.data()), mult_len * sizeof(float));
         UInt64 norms_len = 0;
         readIntBinary(norms_len, istr);
+        const UInt64 expected_norms_len = params.distance_name == "L2Distance" ? num_vectors : 0;
+        if (norms_len != expected_norms_len)
+            throw Exception(
+                ErrorCodes::INCORRECT_DATA,
+                "ScaNN index restore failed: persisted i8 squared L2 norm count {} does not match expected count {}. "
+                "Drop and recreate the index.",
+                norms_len,
+                expected_norms_len);
         int8_norms.resize(norms_len);
         if (norms_len > 0)
             istr.readStrict(reinterpret_cast<char *>(int8_norms.data()), norms_len * sizeof(float));
