@@ -260,7 +260,7 @@ void SettingFieldNumber<T>::readBinary(ReadBuffer & in)
     {
         Int64 x = 0;
         readVarInt(x, in);
-        *this = static_cast<T>(value);
+        *this = static_cast<T>(x);
     }
     else
     {
