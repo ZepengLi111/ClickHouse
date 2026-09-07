@@ -19,7 +19,7 @@ create table dist_01247 as data_01247 engine=Distributed(test_cluster_two_shards
 select * from dist_01247 format Null;
 EOL
 
-# Silence the CI system.*_log_sender background pool so its NETWORK_ERRORs
+# Silence the CI log export sender pool so its NETWORK_ERRORs
 # (when the cloud destination is unreachable) don't contaminate system.errors.
 # This only blocks the async insert sender; SELECT from dist_01247 is unaffected.
 $CLICKHOUSE_CLIENT -q "SYSTEM STOP DISTRIBUTED SENDS"
