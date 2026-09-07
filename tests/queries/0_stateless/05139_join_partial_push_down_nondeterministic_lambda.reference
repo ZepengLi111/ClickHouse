@@ -59,26 +59,32 @@ SELECT 'B3 hidden non deterministic', abs((
         WHERE arrayExists(z -> rand(z) % 2 = 0, [t_left_big.a])) SETTINGS
             query_plan_filter_push_down = 0)) - 1.) < 0.05;
 B3 hidden non deterministic	1
--- CONTROL: a DETERMINISTIC lambda must still be extracted below the join, or the guard has degraded
--- into refusing every lambda-bearing predicate. Unlike B2 this row can only be satisfied by the
+-- CONTROL: a lambda-bearing predicate must still be extracted below the join, or the check has
+-- degraded into refusing every lambda; and the property being pinned is that the check asks whether a
+-- function is deterministic IN THE SCOPE OF ONE QUERY, not the stricter "deterministic always".
+-- `randConstant` draws once per query, so duplicating the extracted copy cannot change any row's
+-- verdict and the extraction is legitimate; under the stricter reading it would be refused, silently
+-- costing this pre-filter to every function that is non-deterministic only across queries. The lambda
+-- captures a column, so here the check reaches the body through a `FunctionCapture` node, where B3
+-- reaches it through a folded `ColumnFunction`. Unlike B2 this row can only be satisfied by the
 -- extraction actually happening: each branch of the disjunction spans both sides, so the main
 -- push-down cannot move the filter, and the extracted per-side predicate is the one plan element that
 -- appears. Counting the plan lines that mention the lambda, rather than matching plan text, keeps
 -- this robust to plan-printer churn; runtime join filters are pinned off because they add a
 -- pre-filter of their own on the left side in both arms.
-SELECT 'B4 deterministic lambda still extracted',
+SELECT 'B4 query constant capturing lambda still extracted',
     (SELECT countIf(explain ILIKE '%arrayExists%') FROM (
         EXPLAIN SELECT t_left_big.a FROM t_left_big JOIN t_right_big ON t_left_big.a = t_right_big.a
-        WHERE (arrayExists(z -> z > 1, [t_left_big.a]) AND t_right_big.b = 7)
-           OR (arrayExists(z -> z > 2, [t_left_big.a]) AND t_right_big.b = 8)) SETTINGS
+        WHERE (arrayExists(z -> randConstant(z + t_left_big.a) % 2 = 0, [t_left_big.a]) AND t_right_big.b = 7)
+           OR (arrayExists(z -> randConstant(z + t_left_big.a) % 2 = 1, [t_left_big.a]) AND t_right_big.b = 8)) SETTINGS
             explain_query_plan_default = 'pretty', query_plan_filter_push_down = 1,
             use_join_disjunctions_push_down = 1, enable_join_runtime_filters = 0)
   > (SELECT countIf(explain ILIKE '%arrayExists%') FROM (
         EXPLAIN SELECT t_left_big.a FROM t_left_big JOIN t_right_big ON t_left_big.a = t_right_big.a
-        WHERE (arrayExists(z -> z > 1, [t_left_big.a]) AND t_right_big.b = 7)
-           OR (arrayExists(z -> z > 2, [t_left_big.a]) AND t_right_big.b = 8)) SETTINGS
+        WHERE (arrayExists(z -> randConstant(z + t_left_big.a) % 2 = 0, [t_left_big.a]) AND t_right_big.b = 7)
+           OR (arrayExists(z -> randConstant(z + t_left_big.a) % 2 = 1, [t_left_big.a]) AND t_right_big.b = 8)) SETTINGS
             explain_query_plan_default = 'pretty', query_plan_filter_push_down = 1,
             use_join_disjunctions_push_down = 0, enable_join_runtime_filters = 0);
-B4 deterministic lambda still extracted	1
+B4 query constant capturing lambda still extracted	1
 DROP TABLE t_left_big;
 DROP TABLE t_right_big;
