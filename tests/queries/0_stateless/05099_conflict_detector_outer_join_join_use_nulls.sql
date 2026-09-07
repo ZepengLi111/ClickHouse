@@ -38,3 +38,33 @@ WHERE t1.id = 2
 DROP TABLE t1;
 DROP TABLE t2;
 DROP TABLE t3;
+
+-- Cross-boundary inner predicate: an inner join whose ON clause references a relation on the far
+-- side of an outer-join boundary (t1.z = t3.z, where t1 is the outer join's null side). With a
+-- detector on, DPsub used to report "Failed to find a valid join order" (Code 717) for these shapes
+-- because the inner operator's ON clause spans {t1,t2,t3} and was wrongly applied at the {t1}|{t2}
+-- split before t3 was joined. The detector must now plan them and return exactly the unoptimized
+-- rows. These queries run the CD path (they enable a conflict detector), unlike 04305 which uses
+-- plain dpsub, so they guard the fix in CI.
+DROP TABLE IF EXISTS t1;
+DROP TABLE IF EXISTS t2;
+DROP TABLE IF EXISTS t3;
+CREATE TABLE t1 (x UInt64, z UInt64) ENGINE = MergeTree ORDER BY x;
+CREATE TABLE t2 (x UInt64, y UInt64) ENGINE = MergeTree ORDER BY x;
+CREATE TABLE t3 (y UInt64, z UInt64) ENGINE = MergeTree ORDER BY y;
+INSERT INTO t1 VALUES (1, 100), (2, 300), (3, 500);
+INSERT INTO t2 VALUES (1, 10), (2, 20), (3, 30);
+INSERT INTO t3 VALUES (10, 999), (20, 300), (30, 500);
+-- Make t2 (the null-supplying relation) look huge so the detector is tempted to join t1/t3 first.
+SET param__internal_join_table_stat_hints = '{"t1": {"cardinality": 3}, "t2": {"cardinality": 1000000}, "t3": {"cardinality": 3}}';
+
+SELECT 'LEFT  cross-boundary cd_c', t1.x, t1.z, t2.x, t2.y, t3.y, t3.z
+FROM t1 LEFT JOIN t2 ON t1.x = t2.x JOIN t3 ON t2.y = t3.y AND t1.z = t3.z ORDER BY ALL
+    SETTINGS query_plan_optimize_join_order_algorithm = 'dpsub', query_plan_optimize_join_order_use_conflict_detector_c = 1;
+SELECT 'RIGHT cross-boundary cd_a', t1.x, t1.z, t2.x, t2.y, t3.y, t3.z
+FROM t1 RIGHT JOIN t2 ON t1.x = t2.x JOIN t3 ON t2.y = t3.y AND t1.z = t3.z ORDER BY ALL
+    SETTINGS query_plan_optimize_join_order_algorithm = 'dpsub', query_plan_optimize_join_order_use_conflict_detector_a = 1;
+
+DROP TABLE t1;
+DROP TABLE t2;
+DROP TABLE t3;
