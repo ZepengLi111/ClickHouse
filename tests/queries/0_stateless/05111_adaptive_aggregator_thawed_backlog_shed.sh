@@ -86,11 +86,47 @@ SELECT 'liveness stream', count() FROM
     GROUP BY k
 );
 
--- This event is incremented only from the new hook, on the thawed baseline spill path in
+-- This event is incremented only from the new hook, on the thawed memory-pressure path in
 -- Aggregator::executeOnBlock, so it is what proves that path was taken. The liveness assertions
 -- above are satisfiable by the pre-existing finish-time drain as well, and the part bound is the
 -- oracle; this one pins the hook itself.
-SELECT 'shed the backlog on the thawed spill path',
+SELECT 'shed the backlog on the thawed pressure path',
+       sumIf(value, event = 'AdaptiveAggregationSpillBacklogSheds') > 0
+FROM system.events;
+"
+
+# The freeze thresholds sit far below the two-level ones, so a thawed producer can carry the whole
+# backlog while its own table is still single-level and unspillable. Waiting for the conversion
+# would leave the backlog resident across the limit checks, which is why the shedding hangs off the
+# memory-pressure trigger rather than off the spill branch. Here the conversion is put out of reach
+# entirely: the hook is the only thing that can shed after the thaw, and with it gated behind the
+# conversion nothing does - measured with this binary, the hook is taken 3-4 times per run, and with
+# it reverted the same query holds ~99 MiB and dies under a 100 MB limit in 2 runs out of 5. The
+# limit is left generous here because the assertion is the counter, not the peak.
+#
+# A separate process again, so that the counter cannot be satisfied by the streams above.
+$CLICKHOUSE_LOCAL --query "
+SET max_threads = 2;
+SET max_block_size = 8192;
+SET enable_adaptive_aggregator = 1;
+SET adaptive_aggregator_freeze_threshold = 1000;
+SET adaptive_aggregator_freeze_threshold_bytes = 0;
+SET group_by_two_level_threshold = 100000000;
+SET group_by_two_level_threshold_bytes = 100000000000;
+SET max_bytes_before_external_group_by = 56000000;
+SET max_bytes_ratio_before_external_group_by = 0;
+SET max_memory_usage = 300000000;
+SET collect_hash_table_stats_during_aggregation = 0;
+
+SELECT 'single-level stream', count() FROM
+(
+    SELECT concat(toString(number % 100000), repeat('x', 60)) AS k
+    FROM numbers_mt(4000000)
+    GROUP BY k
+);
+
+SELECT 'thawed onto the baseline path', sumIf(value, event = 'AdaptiveAggregationThaws') > 0 FROM system.events;
+SELECT 'shed the backlog without a two-level table',
        sumIf(value, event = 'AdaptiveAggregationSpillBacklogSheds') > 0
 FROM system.events;
 "

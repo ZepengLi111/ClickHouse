@@ -2464,6 +2464,23 @@ bool Aggregator::executeOnBlock(Columns columns,
         }
     }
 
+    /// A thawed producer keeps every record it staged before the thaw published for the merge,
+    /// and flushing its own table cannot free them, so left resident they hold the query over
+    /// the external threshold. The backlog is therefore shed under the same trigger the frozen
+    /// branch above uses, and like it before `checkLimits`: the freeze thresholds are far below
+    /// the two-level ones, so a thawed table can carry the whole backlog while still being
+    /// single-level and unspillable, and waiting for the conversion would leave it resident
+    /// across the limit checks. The `initialized` flag also reports that the shared drain table
+    /// the sweep routes into exists.
+    if (adaptive && adaptive->isBaseline() && params.max_bytes_before_external_group_by
+        && current_memory_usage > static_cast<Int64>(params.max_bytes_before_external_group_by)
+        && adaptive->session->initialized.load(std::memory_order_acquire))
+    {
+        ProfileEvents::increment(ProfileEvents::AdaptiveAggregationSpillBacklogSheds);
+        flushPendingChunks(*adaptive);
+        drainStagedChunksUnderMemoryPressure(*adaptive->session);
+    }
+
     bool worth_convert_to_two_level = worthConvertToTwoLevel(
         params.group_by_two_level_threshold, result_size, params.group_by_two_level_threshold_bytes, result_size_bytes);
 
@@ -2485,15 +2502,8 @@ bool Aggregator::executeOnBlock(Columns columns,
         && result.isTwoLevel() && worth_convert_to_two_level
         && current_memory_usage > static_cast<Int64>(params.max_bytes_before_external_group_by))
     {
-        /// Records staged before the thaw stay published for the merge, and flushing this table
-        /// cannot free them, so left resident they hold every later block over the threshold.
-        /// The flag also reports that the shared drain table the sweep routes into exists.
-        if (adaptive->session->initialized.load(std::memory_order_acquire))
-        {
-            ProfileEvents::increment(ProfileEvents::AdaptiveAggregationSpillBacklogSheds);
-            flushPendingChunks(*adaptive);
-            drainStagedChunksUnderMemoryPressure(*adaptive->session);
-        }
+        /// The backlog itself was already shed above, under the same trigger; what is left here
+        /// is the residue below the sweeps' part bound, which no sweep writes.
         if (auto sampled = releaseAdaptiveDrainResidue(*adaptive->session))
             spill_decision_memory = *sampled;
     }
