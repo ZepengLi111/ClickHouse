@@ -1,5 +1,3 @@
-import pytest
-
 from helpers.iceberg_utils import create_iceberg_table, get_uuid_str
 
 
@@ -7,21 +5,19 @@ from helpers.iceberg_utils import create_iceberg_table, get_uuid_str
 # table whose bucket had gone away made the start spend the S3 client's whole retry budget before
 # the table was attached, which kept a service in "Starting" for tens of minutes.
 # https://github.com/ClickHouse/support-escalation/issues/8579
+#
+# The table lives in Azurite rather than MinIO because with CLICKHOUSE_USE_DATABASE_DISK the
+# server's own metadata disk is in MinIO, and pausing that stops the start for an unrelated reason.
 def test_startup_with_unavailable_bucket(started_cluster_iceberg_no_spark):
     cluster = started_cluster_iceberg_no_spark
     instance = cluster.instances["node1"]
 
-    # With a remote database disk the server keeps its own metadata in the same MinIO, so pausing it
-    # stops the server from starting at all, for a reason that has nothing to do with the table.
-    if instance.with_remote_database_disk:
-        pytest.skip("The server's own metadata disk is in the MinIO this test pauses")
-
     table_name = "test_startup_with_unavailable_bucket_" + get_uuid_str()
 
-    create_iceberg_table("s3", instance, table_name, cluster, "(x Int32)")
+    create_iceberg_table("azure", instance, table_name, cluster, "(x Int32)")
     instance.query(f"INSERT INTO {table_name} VALUES (1)")
 
-    with cluster.pause_container("minio1"):
+    with cluster.pause_container("azurite1"):
         instance.restart_clickhouse()
 
         # The table is listed, with unknown totals rather than a failure.
