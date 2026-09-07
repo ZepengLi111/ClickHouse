@@ -41,7 +41,6 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int INCORRECT_DATA;
-    extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
     extern const int TYPE_MISMATCH;
     extern const int VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE;
