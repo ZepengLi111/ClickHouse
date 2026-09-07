@@ -285,9 +285,18 @@ DPSubJoinOrderOptimizer::isValidJoinOrderMaskConflict(UInt32 left_mask, UInt32 r
         /// child no longer has a crossing predicate. The relation-set straddle is a fallback only
         /// for degenerate predicate-less operators (empty NEL, e.g. an ON-TRUE join).
         const bool within = subset_of(op.relations, combined);
+        /// The predicate can only be applied at this node when every relation it references is
+        /// present; otherwise it belongs to a higher node (a relation it needs is not joined yet).
+        /// Without this, an ancestor operator whose ON clause happens to reference two relations that
+        /// end up on opposite sides of a *lower* split -- e.g. an inner join `... AND t1.z = t3.z`
+        /// sitting above `t2 LEFT JOIN t1`, whose `nel` spans {t1,t2,t3} -- is wrongly treated as
+        /// crossing the {t1}|{t2} split, and its required set (which includes the not-yet-joined t3)
+        /// can satisfy neither orientation, rejecting every ordering of {t1,t2} and failing to find
+        /// any valid join order.
+        const bool nel_within = subset_of(op.nel, combined);
         const bool nel_crosses = (op.nel & left_mask) && (op.nel & right_mask);
         const bool rel_straddles = (op.relations & left_mask) && (op.relations & right_mask);
-        const bool involved = nel_crosses || (op.nel == 0 && rel_straddles && within);
+        const bool involved = (nel_within && nel_crosses) || (op.nel == 0 && rel_straddles && within);
         if (!involved)
             continue;
 
