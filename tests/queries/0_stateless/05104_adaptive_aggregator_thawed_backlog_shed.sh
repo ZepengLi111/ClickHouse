@@ -15,14 +15,21 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # stream then proves repeat-dominated and thaws them. Two producers keep the whole backlog resident.
 # The thaw cannot fire before 524288 staged records, which at these key widths is about 42 MB of
 # them, so the threshold has to sit above that or the sweeps shed the backlog before the thaw and
-# there is nothing left to stay resident: 56 MB leaves it at about three quarters of the threshold,
-# the proportion the failing job sat at. Above about 66 MB the thawed tables never carry the query
-# over the threshold again and no baseline spill decision is ever taken.
+# there is nothing left to stay resident.
+#
+# What carries the query back over the threshold after the thaw is the growth of the two baseline
+# tables the thaw hands the producers, on top of the resident backlog, so the key space is wide
+# enough that this growth is several times the margin the backlog leaves rather than comparable to
+# it. Measured on this tree, the shedding then still fires over the whole 30-80 MB band of
+# thresholds, instead of only the 42-66 MB the 50000-key stream held it in, where a producer that
+# ran a little ahead of its twin could let the frozen sweeps shed the backlog before the thaw and
+# leave nothing resident. That narrow band is what made this test flaky in CI.
 #
 # What the assertions bound is the part count, not the peak: measured with this binary the resident
-# backlog costs 97-119 parts against 5-6 with it shed, while the peak differs by half a threshold.
+# backlog costs 365-390 parts against 5-7 with it shed, while the peak differs by half a threshold.
 # The memory limit is left as generous as the rest of the family's, so that a sanitizer arm, which
-# pays several times over per part written and read back, cannot fail on the peak alone.
+# pays several times over per part written and read back, cannot fail on the peak alone; the shed
+# arm peaks under 100 MB here.
 #
 # The query runs in its own clickhouse-local process, so the counters in `system.events` belong to
 # it alone.
@@ -43,8 +50,8 @@ SET collect_hash_table_stats_during_aggregation = 0;
 
 SELECT count() FROM
 (
-    SELECT concat(toString(number % 50000), repeat('x', 60)) AS k
-    FROM numbers_mt(2000000)
+    SELECT concat(toString(number % 100000), repeat('x', 60)) AS k
+    FROM numbers_mt(4000000)
     GROUP BY k
 );
 
@@ -59,10 +66,10 @@ FROM system.events;
 -- the shedding is guarded by, so this is what proves the baseline spill decision was reached.
 SELECT 'went external', sumIf(value, event = 'ExternalAggregationWritePart') > 0 FROM system.events;
 -- One part per block is the defect: a producer that finds the backlog resident on every block
--- writes its own few keys out on every block. 2000000 rows in blocks of 8192 is 244 blocks, and an
+-- writes its own few keys out on every block. 4000000 rows in blocks of 8192 is 488 blocks, and an
 -- eighth of that leaves the handful of parts a shed backlog costs a wide margin.
 SELECT 'parts stay far below the block count',
-       sumIf(value, event = 'ExternalAggregationWritePart') * 8 < intDiv(2000000, 8192)
+       sumIf(value, event = 'ExternalAggregationWritePart') * 8 < intDiv(4000000, 8192)
 FROM system.events;
 -- Without these the test could pass by never engaging the adaptive aggregator, or by never leaving
 -- the frozen path, whose shedding is not what this covers.
