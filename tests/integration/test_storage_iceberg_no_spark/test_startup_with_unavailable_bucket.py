@@ -1,3 +1,5 @@
+import pytest
+
 from helpers.iceberg_utils import create_iceberg_table, get_uuid_str
 
 
@@ -8,6 +10,12 @@ from helpers.iceberg_utils import create_iceberg_table, get_uuid_str
 def test_startup_with_unavailable_bucket(started_cluster_iceberg_no_spark):
     cluster = started_cluster_iceberg_no_spark
     instance = cluster.instances["node1"]
+
+    # With a remote database disk the server keeps its own metadata in the same MinIO, so pausing it
+    # stops the server from starting at all, for a reason that has nothing to do with the table.
+    if instance.with_remote_database_disk:
+        pytest.skip("The server's own metadata disk is in the MinIO this test pauses")
+
     table_name = "test_startup_with_unavailable_bucket_" + get_uuid_str()
 
     create_iceberg_table("s3", instance, table_name, cluster, "(x Int32)")
