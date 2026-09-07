@@ -194,19 +194,16 @@ public:
         const flatbuf::RecordBatch & batch, const PODArray<char> & body, const ArrowField & value_field,
         const DictionaryUse & use, const UnorderedMapWithMemoryTracking<String, DataTypePtr> * target_types_);
 
-    /// The buffers (indices into `batch.buffers()`) referenced by the requested top-level fields, as a
-    /// 0/1 mask of length `batch.buffers()->size()`. Computed by the same cursor walk decoding uses
-    /// (`skipField`), so it stays in lockstep with the decoder's per-field buffer consumption. Used to read,
-    /// validate and decompress only the body ranges a subset read actually needs. Returns an all-ones mask
-    /// (everything reachable) when `keep_top_level_fields` is null, or if the layout cannot be pre-walked
-    /// (the decode path then runs its full validation and reports the precise error).
+    /// Returns a 0/1 mask of the buffers referenced by the requested top-level fields. The `advanceField`
+    /// traversal follows decoding's layout so subset reads can load, validate and decompress only the
+    /// needed ranges. Returns an all-ones mask when `keep_top_level_fields` is null or the layout cannot
+    /// be traversed; decoding then reports the precise validation error.
     VectorWithMemoryTracking<char> reachableTopLevelBuffers(
         const flatbuf::RecordBatch & batch, const UnorderedSetWithMemoryTracking<String> * keep_top_level_fields);
 
-    /// Verifies the batch declares exactly the FieldNodes, buffers and variadic counts that `fields` consume,
-    /// using the same cursor walk as decoding (`skipField`). Rejects a malformed batch (surplus or missing)
-    /// before its body is materialized, so a dictionary batch carrying buffers beyond its single value field
-    /// is not read or decompressed only to be ignored. Throws `INCORRECT_DATA` on a mismatch.
+    /// Verifies that declared node, buffer and variadic counts match the traversal of `fields` by
+    /// `advanceField`. Rejects missing or surplus entries before a dictionary batch's body is read or
+    /// decompressed. Throws `INCORRECT_DATA` on a mismatch.
     void validateBatchLayout(const flatbuf::RecordBatch & batch, const ArrowFields & fields);
 
     /// For every dictionary id the kept top-level fields reference (all fields when `keep_top_level_fields`
@@ -273,11 +270,11 @@ private:
     /// Consumes and decodes the offsets buffer of a List/LargeList/Map field into ClickHouse array
     /// offsets (per-slot cumulative lengths relative to the first offset), validating that the first
     /// offset is non-negative and that the sequence is monotonic non-decreasing (each offset compared
-    /// with its predecessor, not only with the first). `what` names the field in those errors ("list",
-    /// "map") and `offsets_what` names its offsets buffer in the buffer-size error.
+    /// with its predecessor, not only with the first). `what` names the field in those errors.
     ColumnUInt64::MutablePtr decodeListOffsets(
-        size_t rows, bool large, const char * what, const char * offsets_what, Int64 & base, Int64 & prev);
+        size_t rows, bool large, const char * what, Int64 & base, Int64 & prev);
 
+    /// Decodes a field after `decodeBatchColumn` validates its subtree's node lengths and buffer sizes.
     /// `allow_low_cardinality` lets top-level dictionary fields retain `LowCardinality`; nested dictionary
     /// fields are materialized to their plain value column, matching `fieldToCHType`.
     /// `target_hint` supplies the requested type inherited from the parent. `resolveTargetHint` uses it or
@@ -292,9 +289,9 @@ private:
         const DataTypePtr & target_hint, const String & path, size_t list_depth,
         const InvisibleRowsMask * invisible_rows, ColumnUInt8::Ptr * decoded_null_map = nullptr);
     /// Advances the node/buffer/variadic cursors over `field` exactly as `decodeField` would, without
-    /// reading or materializing its data. Used to skip an unrequested top-level column while keeping the
-    /// flat node/buffer cursors aligned for the columns that follow.
-    void skipField(const ArrowField & field);
+    /// materializing its data. With `validate_lengths`, checks buffer sizes and row-aligned child
+    /// lengths before decoding. Otherwise, skips unrequested values without reading their buffers.
+    void advanceField(const ArrowField & field, bool validate_lengths = false);
     ColumnPtr decodeInner(
         const ArrowField & field, size_t rows, const DataTypePtr & target_hint, const String & path,
         size_t list_depth, const InvisibleRowsMask * invisible_rows);

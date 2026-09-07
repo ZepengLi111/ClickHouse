@@ -542,6 +542,14 @@ size_t requiredBytes(size_t count, size_t elem_size)
     return bytes;
 }
 
+size_t dictionaryIndexByteWidth(int bits)
+{
+    if (bits != 8 && bits != 16 && bits != 32 && bits != 64)
+        throw Exception(
+            ErrorCodes::INCORRECT_DATA, "Arrow IPC dictionary index bit width {} is not supported (must be 8, 16, 32, or 64)", bits);
+    return static_cast<size_t>(bits) / 8;
+}
+
 /// The number of child rows a fixed-size list of `rows` rows holds. `list_size` is untrusted IPC metadata:
 /// a negative value would wrap to a huge `size_t`, and a zero would make the child length independent of
 /// `rows`, leaving a forged parent row count unbounded. Reject a non-positive size, and multiply with the
@@ -566,16 +574,14 @@ void defaultInvisibleFixed(char * data, size_t value_size, size_t rows, const In
             memset(data + i * value_size, 0, value_size);
 }
 
-/// Fills a fixed-width ClickHouse column (ColumnVector / ColumnDecimal) by copying `value_size`
-/// bytes per row from the source buffer. For decimals `value_size` may be smaller than the Arrow
-/// storage width, so the low (little-endian) bytes are taken per value.
+/// Copies fixed-width values into a `ColumnVector` or `ColumnDecimal`. The source buffer has
+/// `arrow_value_size` bytes per row; narrower ClickHouse decimals keep each value's low bytes.
 template <typename Col>
 void fillFixed(
     IColumn & column, size_t rows, const RecordBatchDecoder::Slice & values, size_t arrow_value_size,
     const InvisibleRowsMask * invisible_rows)
 {
     using V = typename Col::ValueType;
-    checkBufferSize(values, requiredBytes(rows, arrow_value_size), "values");
     auto & data = assert_cast<Col &>(column).getData();
     data.resize(rows);
     if (rows == 0)
@@ -599,16 +605,6 @@ void fillFixed(
 
 ColumnUInt8::Ptr RecordBatchDecoder::buildNullMap(const Slice & validity, size_t rows, Int64 null_count) const
 {
-    /// A non-zero or unknown null count requires a bitmap that covers every row.
-    if (null_count != 0)
-    {
-        if (validity.length == 0)
-            throw Exception(
-                ErrorCodes::INCORRECT_DATA,
-                "Arrow IPC field declares a null count of {} but omits the validity bitmap", null_count);
-        checkBufferSize(validity, (rows + 7) / 8, "validity");
-    }
-
     auto null_map = ColumnUInt8::create(rows);
     auto & data = null_map->getData();
     if (null_count == 0)
@@ -678,7 +674,6 @@ ColumnPtr RecordBatchDecoder::decodeInner(
             else
             {
                 /// half-float -> Float32
-                checkBufferSize(values, requiredBytes(rows, sizeof(UInt16)), "half_float");
                 auto & data = assert_cast<ColumnFloat32 &>(*column).getData();
                 data.resize(rows);
                 const auto * src = reinterpret_cast<const UInt16 *>(values.ptr);
@@ -690,7 +685,6 @@ ColumnPtr RecordBatchDecoder::decodeInner(
         case TypeKind::Bool:
         {
             const Slice values = nextBuffer();
-            checkBufferSize(values, (rows + 7) / 8, "bool");
             auto & data = assert_cast<ColumnUInt8 &>(*column).getData();
             data.resize(rows);
             const auto * bits = reinterpret_cast<const uint8_t *>(values.ptr);
@@ -775,7 +769,6 @@ ColumnPtr RecordBatchDecoder::decodeInner(
                     : date32_as_datetime ? "DateTime"
                     : dt64_hint ? stripped_effective_hint->getName()
                     : "Date32";
-                checkBufferSize(values, requiredBytes(rows, sizeof(Int32)), "date32");
                 auto & data = assert_cast<ColumnInt32 &>(*column).getData();
                 data.resize(rows);
                 const auto * src = reinterpret_cast<const Int32 *>(values.ptr);
@@ -806,7 +799,6 @@ ColumnPtr RecordBatchDecoder::decodeInner(
             else
             {
                 /// date64: milliseconds since the epoch, maps to DateTime (UInt32 seconds).
-                checkBufferSize(values, requiredBytes(rows, sizeof(Int64)), "date64");
                 auto & data = assert_cast<ColumnUInt32 &>(*column).getData();
                 data.resize(rows);
                 const auto * src = reinterpret_cast<const Int64 *>(values.ptr);
@@ -830,7 +822,6 @@ ColumnPtr RecordBatchDecoder::decodeInner(
             const Slice values = nextBuffer();
             if (type.time_bit_width == 32)
             {
-                checkBufferSize(values, requiredBytes(rows, sizeof(Int32)), "time32");
                 auto & data = assert_cast<ColumnDecimal<Time64> &>(*column).getData();
                 data.resize(rows);
                 const auto * src = reinterpret_cast<const Int32 *>(values.ptr);
@@ -860,11 +851,6 @@ ColumnPtr RecordBatchDecoder::decodeInner(
             /// A zero-row column may omit its offsets buffer entirely; nothing to decode.
             if (rows == 0)
                 break;
-
-            /// Validate the offsets buffer before reserving: an inflated (or forged-huge) row count would
-            /// otherwise reserve gigabytes (and hit the memory limit) before this check could reject the file.
-            const size_t offset_size = large ? sizeof(Int64) : sizeof(Int32);
-            checkBufferSize(offsets_slice, requiredBytes(rows + 1, offset_size), "offsets");
 
             string_column.reserve(rows);
             string_column.getChars().reserve(static_cast<size_t>(data_slice.length) + rows);
@@ -916,17 +902,8 @@ ColumnPtr RecordBatchDecoder::decodeInner(
             /// buffers. Each view is {int32 length; if length<=12 inline 12 bytes; else int32 prefix,
             /// int32 buffer_index, int32 offset into that data buffer}.
             const Slice views = nextBuffer();
-            checkBufferSize(views, requiredBytes(rows, 16), "binary view");
             const Int64 num_data = variadic_index < variadic_counts.size() ? variadic_counts[variadic_index] : 0;
             ++variadic_index;
-            /// `num_data` is untrusted IPC metadata (already checked non-negative in `beginBatch`). A forged
-            /// huge positive count would drive an oversized `reserve` before `nextBuffer` notices the batch has
-            /// fewer buffers; cap it at the number of remaining buffers first.
-            if (static_cast<size_t>(num_data) > buffer_slices.size() - buffer_index)
-                throw Exception(
-                    ErrorCodes::INCORRECT_DATA,
-                    "Arrow IPC binary view column declares {} data buffers but only {} remain",
-                    num_data, buffer_slices.size() - buffer_index);
             VectorWithMemoryTracking<Slice> data_buffers;
             data_buffers.reserve(static_cast<size_t>(num_data));
             for (Int64 i = 0; i < num_data; ++i)
@@ -974,7 +951,6 @@ ColumnPtr RecordBatchDecoder::decodeInner(
         {
             const Slice values = nextBuffer();
             const size_t n = static_cast<size_t>(type.byte_width);
-            checkBufferSize(values, requiredBytes(rows, n), "fixed_size_binary");
             if (isUUIDField(field))
             {
                 /// 16 bytes per value, with the two 64-bit halves byte-reversed (matches the writer).
@@ -1015,21 +991,13 @@ ColumnPtr RecordBatchDecoder::decodeInner(
                 list_depth, invisible_rows);
         case TypeKind::FixedSizeList:
         {
-            /// No offsets buffer: each row has exactly `list_size` elements, so the child holds exactly
-            /// `rows * list_size` of them. Reject a mismatched child FieldNode length BEFORE decodeField: a
-            /// buffer-less child type (e.g. Null) derives its size from the length alone, so a forged-huge
-            /// length would otherwise drive an unbounded null-map allocation that a post-decode size check
-            /// could not prevent.
-            const size_t expected_child = fixedSizeListChildRows(type, rows);
+            /// Each row owns `list_size` child elements; the layout pass validates their total count.
             const size_t list_size = static_cast<size_t>(type.list_size);
-            expectNextNodeLength(expected_child, "fixed-size-list child");
+            const size_t expected_child = rows * list_size;
             const ArrowField & child_field = type.children.at(0);
 
-            /// A child that is not determined by its size alone costs at least one bit per element, in its
-            /// value buffers or its validity bitmap, so `expected_child` — and with it `rows` — is physically
-            /// bounded by the body. `list_size` multiplies the row count, so this bound is what keeps a
-            /// forged one from sizing the offsets below, the mask, or a buffer-less field declared ahead of
-            /// the child's buffered ones, before those buffers are checked.
+            /// Children with physical data remain subject to the message-body row bound. Children
+            /// determined by their size alone are materialized only for visible slots below.
             const bool size_determined_child = isSizeDeterminedSubtree(child_field);
             if (!size_determined_child)
                 checkRowCountWithinBody(expected_child, "fixed-size-list child");
@@ -1077,14 +1045,6 @@ ColumnPtr RecordBatchDecoder::decodeInner(
             for (size_t i = 0; i < type.children.size(); ++i)
             {
                 const ArrowField & child = type.children[i];
-                /// Every struct field carries its own `FieldNode.length`, but they must all equal the
-                /// parent struct's row count; a malformed file can shorten one field, which would leave
-                /// a `ColumnTuple` with elements of unequal size (the Apache Arrow library reader's
-                /// `StructArray::field()` silently clamps such fields instead). Reject a mismatch BEFORE
-                /// decodeField: a buffer-less field type (e.g. a Null field) derives its size from the
-                /// length alone, so a forged-huge length would otherwise drive an unbounded null-map
-                /// allocation that a post-decode size check could not prevent.
-                expectNextNodeLength(rows, fmt::format("struct field '{}'", child.name));
                 /// Struct children are row-aligned with the parent, so the invisible-rows mask (which
                 /// already includes this struct's own nulls, composed in `decodeField`) passes through
                 /// unchanged: the bytes of a child slot under a null struct row are undefined per the
@@ -1102,15 +1062,12 @@ ColumnPtr RecordBatchDecoder::decodeInner(
             /// Map is List<Struct<key, value>>: read the list offsets, then the entries struct.
             Int64 base = 0;
             Int64 prev = 0;
-            auto offsets_col = decodeListOffsets(rows, /*large=*/false, "map", "map offsets", base, prev);
+            auto offsets_col = decodeListOffsets(rows, /*large=*/false, "map", base, prev);
             auto & offs = offsets_col->getData();
             const ArrowField & entries_field = type.children.at(0);
 
-            /// The entries struct must cover the entries the offsets reference and may declare more (a sliced
-            /// Arrow map keeps the full entries). It is decoded in full and costs at least one bit per entry,
-            /// so its declared length is physically bounded by the body; enforcing that before decodeField
-            /// keeps a forged length from sizing the invisible-rows mask, or a buffer-less value field,
-            /// before the key's buffers are checked.
+            /// A sliced map can retain unreferenced entries. Its declared entry count must cover every
+            /// referenced entry and stay within the message-body row bound.
             expectNextNodeLengthAtLeast(static_cast<size_t>(prev), "map entries");
             checkRowCountWithinBody(peekNodeRows(), "map entries");
 
@@ -1156,18 +1113,9 @@ ColumnPtr RecordBatchDecoder::decodeInner(
 }
 
 ColumnUInt64::MutablePtr RecordBatchDecoder::decodeListOffsets(
-    size_t rows, bool large, const char * what, const char * offsets_what, Int64 & base, Int64 & prev)
+    size_t rows, bool large, const char * what, Int64 & base, Int64 & prev)
 {
     const Slice offsets_slice = nextBuffer();
-    const size_t offset_size = large ? sizeof(Int64) : sizeof(Int32);
-
-    /// A zero-row list may omit its offsets buffer entirely (Apache Arrow Java < 19.0.0 emits a 0-byte
-    /// offsets buffer for an empty nested List). No offset is read for zero rows, so require no bytes.
-    /// Validate the buffer BEFORE allocating `offsets_col`: this bounds `rows` to the actual buffer
-    /// size, so a forged-huge `rows` cannot drive an `rows * 8` byte allocation before being rejected.
-    if (rows > 0)
-        checkBufferSize(offsets_slice, requiredBytes(rows + 1, offset_size), offsets_what);
-
     auto read_offset = [&](size_t i) -> Int64
     {
         if (large)
@@ -1179,6 +1127,7 @@ ColumnUInt64::MutablePtr RecordBatchDecoder::decodeListOffsets(
     auto & offs = offsets_col->getData();
     base = 0;
     prev = 0;
+    /// A zero-row list may omit its offsets buffer, so no offset is read for an empty column.
     if (rows > 0)
     {
         base = read_offset(0);
@@ -1205,7 +1154,7 @@ ColumnPtr RecordBatchDecoder::readOffsetsAndChild(
 {
     Int64 base = 0;
     Int64 prev = 0;
-    auto offsets_col = decodeListOffsets(rows, large, "list", "list offsets", base, prev);
+    auto offsets_col = decodeListOffsets(rows, large, "list", base, prev);
     auto & offs = offsets_col->getData();
     const ArrowField & child_field = field.type.children.at(0);
 
@@ -1226,10 +1175,8 @@ ColumnPtr RecordBatchDecoder::readOffsetsAndChild(
         return ColumnArray::create(child, std::move(offsets_col));
     }
 
-    /// Any other child costs at least one bit per row, in its value buffers or its validity bitmap, so its
-    /// declared length is physically bounded by the body; enforcing that before decodeField keeps a forged
-    /// length from sizing the invisible-rows mask, or a buffer-less field declared ahead of the child's
-    /// buffered ones, before those buffers are checked.
+    /// Children with physical data are decoded at their full declared length, which must stay within
+    /// the message-body row bound even when some rows are unreferenced.
     checkRowCountWithinBody(peekNodeRows(), "list child");
 
     /// Rows of the child that only invisible slots reference — or that no slot references — hold
@@ -1279,8 +1226,8 @@ ColumnPtr RecordBatchDecoder::buildSizeDeterminedColumn(
     if (type.kind == TypeKind::Null)
         return ColumnNullable::create(ColumnNothing::create(rows), ColumnUInt8::create(rows, UInt8{1}));
 
-    /// A struct or fixed-size-list node: its validity slot (consumed as by `decodeField`), then its children,
-    /// whose nodes must declare the lengths the decoding path requires of them (see `decodeInner`).
+    /// Constant roots bypass the layout pass, so this traversal validates child lengths while
+    /// consuming each struct or fixed-size-list node's validity slot and children.
     nextBuffer();
     const DataTypePtr effective_hint = resolveTargetHint(target_hint, path, list_depth);
     ColumnPtr inner;
@@ -1328,12 +1275,6 @@ ColumnPtr RecordBatchDecoder::decodeDictionary(
 
     const int bits = field.dictionary->index_bit_width;
     const bool index_is_signed = field.dictionary->index_is_signed;
-    /// The index width determines the required buffer size and must be validated before allocating indexes.
-    if (bits != 8 && bits != 16 && bits != 32 && bits != 64)
-        throw Exception(
-            ErrorCodes::INCORRECT_DATA, "Arrow IPC dictionary index bit width {} is not supported (must be 8, 16, 32, or 64)", bits);
-    const size_t index_size = static_cast<size_t>(bits) / 8;
-    checkBufferSize(indices_slice, requiredBytes(rows, index_size), "dictionary indices");
 
     VectorWithMemoryTracking<FieldDictionaryValues> segments;
     segments.reserve(dictionary.segments.size());
@@ -1428,14 +1369,12 @@ ColumnPtr RecordBatchDecoder::decodeUnion(const ArrowField & field, size_t rows,
 
     /// A union has no validity buffer: a types buffer (int8), and for dense unions an offsets buffer (int32).
     const Slice type_ids_slice = nextBuffer();
-    checkBufferSize(type_ids_slice, rows, "union type ids");
     const auto * type_ids = reinterpret_cast<const int8_t *>(type_ids_slice.ptr);
 
     const Int32 * value_offsets = nullptr;
     if (dense)
     {
         const Slice offsets_slice = nextBuffer();
-        checkBufferSize(offsets_slice, requiredBytes(rows, sizeof(Int32)), "union offsets");
         value_offsets = reinterpret_cast<const Int32 *>(offsets_slice.ptr);
     }
 
@@ -1468,15 +1407,10 @@ ColumnPtr RecordBatchDecoder::decodeUnion(const ArrowField & field, size_t rows,
             continue;
         }
 
-        /// Bound the child's declared length BEFORE decodeField, so forged metadata cannot drive an
-        /// oversized allocation in a buffer-less child subtree (e.g. a struct of `null` fields, whose
-        /// null maps are sized by the FieldNode length alone). A sparse child holds exactly `rows`
-        /// values (the per-row child access below indexes it by row); a dense child's length is only
-        /// lower-bounded by the referenced offsets, but still by what the body can physically hold.
+        /// Dense children can declare more rows than the union references. Their visibility masks
+        /// cover every declared row, including bufferless children, so the message-body row bound applies.
         if (dense)
             checkRowCountWithinBody(peekNodeRows(), fmt::format("dense union child '{}'", child.name));
-        else
-            expectNextNodeLength(rows, fmt::format("sparse union child '{}'", child.name));
 
         /// Visibility of this child's rows: a child slot holds a meaningful value only when its row's
         /// type id selects this child — non-selected slots hold undefined bytes per the Arrow spec, even
@@ -1628,11 +1562,7 @@ ColumnPtr RecordBatchDecoder::decodeField(
         *decoded_null_map = nullptr;
 
     const flatbuf::FieldNode & node = nextNode();
-    /// Arrow lengths are signed and must be validated before conversion to a row count.
-    const Int64 node_length = node.length();
-    if (node_length < 0)
-        throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow IPC field node has a negative length {}", node_length);
-    const size_t rows = static_cast<size_t>(node_length);
+    const size_t rows = static_cast<size_t>(node.length());
 
     /// Dictionary fields store index validity and indices here; their value layout is in `DictionaryBatch`.
     /// The value-type branches apply only to fields whose values are inline.
@@ -1704,131 +1634,172 @@ bool RecordBatchDecoder::wrapsInNullable(const ArrowField & field, const IColumn
         && (field.type.kind != TypeKind::Struct || preserve_struct_nulls);
 }
 
-void RecordBatchDecoder::skipField(const ArrowField & field)
+void RecordBatchDecoder::advanceField(const ArrowField & field, bool validate_lengths)
 {
-    /// Consume this field's FieldNode, mirroring decodeField.
-    nextNode();
+    const auto & node = nextNode();
+    if (validate_lengths && node.length() < 0)
+        throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow IPC field node has a negative length {}", node.length());
+    const size_t rows = validate_lengths ? static_cast<size_t>(node.length()) : 0;
 
-    /// A dictionary-encoded field is physically an index array here (validity slot + indices); its
-    /// value-type layout lives only in the DictionaryBatch. Handle it before the value-type special cases
-    /// below, which would otherwise consume the wrong buffers and desync the cursor.
+    auto consume_buffer = [&](size_t count, size_t width, const char * what)
+    {
+        const Slice buffer = nextBuffer();
+        if (validate_lengths)
+            checkBufferSize(buffer, requiredBytes(count, width), what);
+    };
+    auto consume_validity = [&]
+    {
+        const Slice validity = nextBuffer();
+        if (validate_lengths && node.null_count() != 0)
+        {
+            if (validity.length == 0)
+                throw Exception(
+                    ErrorCodes::INCORRECT_DATA,
+                    "Arrow IPC field declares a null count of {} but omits the validity bitmap", node.null_count());
+            checkBufferSize(validity, (rows + 7) / 8, "validity");
+        }
+    };
+
+    /// Dictionary fields contain indices here; their value layout belongs to a separate batch.
     if (field.dictionary)
     {
-        nextBuffer(); /// validity
-        nextBuffer(); /// indices
+        consume_validity();
+        const size_t width = validate_lengths ? dictionaryIndexByteWidth(field.dictionary->index_bit_width) : 0;
+        consume_buffer(rows, width, "dictionary indices");
         return;
     }
 
-    /// Unions carry no validity buffer (decodeField dispatches to decodeUnion before consuming one):
-    /// a type-ids buffer, an offsets buffer for dense unions, then one subtree per child — a null-typed
-    /// child being just a placeholder node, exactly as decodeUnion consumes them.
-    if (field.type.kind == TypeKind::Union)
+    const auto & type = field.type;
+    if (type.kind == TypeKind::Union)
     {
-        nextBuffer();
-        if (field.type.union_mode == flatbuf::UnionMode_Dense)
-            nextBuffer();
-        for (const ArrowField & child : field.type.children)
+        const bool dense = type.union_mode == flatbuf::UnionMode_Dense;
+        consume_buffer(rows, 1, "union type ids");
+        if (dense)
+            consume_buffer(rows, sizeof(Int32), "union offsets");
+        for (const ArrowField & child : type.children)
         {
             if (child.type.kind == TypeKind::Null)
                 nextNode();
             else
-                skipField(child);
+            {
+                if (validate_lengths && !dense)
+                    expectNextNodeLength(rows, fmt::format("sparse union child '{}'", child.name));
+                advanceField(child, validate_lengths);
+            }
         }
         return;
     }
 
-    /// A null-typed field has no buffers at all (not even validity).
-    if (field.type.kind == TypeKind::Null)
+    /// `Null` and `RunEndEncoded` fields have no validity buffer of their own.
+    if (type.kind == TypeKind::Null)
         return;
-
-    /// RunEndEncoded has no buffers of its own — not even validity (its nulls live in the `values` child).
-    /// The reader cannot decode it, but its layout is known well enough to skip an unrequested column: just
-    /// its two children (run_ends, values). Handle it before consuming the validity buffer below.
-    if (field.type.kind == TypeKind::Unsupported && field.type.skip_layout == ArrowType::SkipLayout::RunEndEncoded)
+    if (type.kind == TypeKind::Unsupported && type.skip_layout == ArrowType::SkipLayout::RunEndEncoded)
     {
-        for (const ArrowField & child : field.type.children)
-            skipField(child);
+        for (const ArrowField & child : type.children)
+            advanceField(child, validate_lengths);
         return;
     }
 
-    /// Validity buffer, present for every other field.
-    nextBuffer();
+    consume_validity();
 
-    switch (field.type.kind)
+    switch (type.kind)
     {
-        /// Fixed-width / primitive layouts: a single data buffer after the validity buffer. `Interval` is
-        /// included for skipping although decodeInner does not decode it, so an unrequested Arrow interval
-        /// column does not block reading the other columns.
         case TypeKind::Int:
+            consume_buffer(rows, type.bit_width / 8, "values");
+            break;
         case TypeKind::FloatingPoint:
+        {
+            const size_t width = type.float_precision == flatbuf::Precision_DOUBLE ? sizeof(Float64)
+                : type.float_precision == flatbuf::Precision_SINGLE ? sizeof(Float32) : sizeof(UInt16);
+            consume_buffer(rows, width, "values");
+            break;
+        }
         case TypeKind::Bool:
+            consume_buffer((rows + 7) / 8, 1, "bool");
+            break;
         case TypeKind::Decimal:
+            consume_buffer(rows, type.decimal_bit_width / 8, "values");
+            break;
         case TypeKind::Date:
+            consume_buffer(rows, type.unit == flatbuf::DateUnit_DAY ? sizeof(Int32) : sizeof(Int64), "values");
+            break;
         case TypeKind::Time:
+            consume_buffer(rows, type.time_bit_width / 8, "values");
+            break;
         case TypeKind::Timestamp:
         case TypeKind::Duration:
-        case TypeKind::Interval:
-        case TypeKind::FixedSizeBinary:
-            nextBuffer();
+            consume_buffer(rows, sizeof(Int64), "values");
             break;
-        /// Variable-length binary/utf8: an offsets buffer and a data buffer.
+        case TypeKind::Interval:
+        {
+            const size_t width = type.unit == flatbuf::IntervalUnit_YEAR_MONTH ? 4
+                : type.unit == flatbuf::IntervalUnit_DAY_TIME ? 8 : 16;
+            consume_buffer(rows, width, "interval");
+            break;
+        }
+        case TypeKind::FixedSizeBinary:
+            consume_buffer(rows, type.byte_width, "fixed_size_binary");
+            break;
         case TypeKind::Utf8:
         case TypeKind::LargeUtf8:
         case TypeKind::Binary:
         case TypeKind::LargeBinary:
-            nextBuffer();
+        {
+            const bool large = type.kind == TypeKind::LargeUtf8 || type.kind == TypeKind::LargeBinary;
+            consume_buffer(rows ? rows + 1 : 0, large ? sizeof(Int64) : sizeof(Int32), "offsets");
             nextBuffer();
             break;
-        /// View layouts: a views buffer plus a metadata-declared number of variadic data buffers.
+        }
         case TypeKind::BinaryView:
         case TypeKind::Utf8View:
         {
-            nextBuffer();
+            consume_buffer(rows, 16, "binary view");
             const Int64 num_data = variadic_index < variadic_counts.size() ? variadic_counts[variadic_index] : 0;
             ++variadic_index;
+            if (validate_lengths && static_cast<size_t>(num_data) > buffer_slices.size() - buffer_index)
+                throw Exception(
+                    ErrorCodes::INCORRECT_DATA,
+                    "Arrow IPC binary view column declares {} data buffers but only {} remain",
+                    num_data, buffer_slices.size() - buffer_index);
             for (Int64 i = 0; i < num_data; ++i)
                 nextBuffer();
             break;
         }
-        /// List/Map: an offsets buffer, then the single child subtree.
         case TypeKind::List:
         case TypeKind::LargeList:
         case TypeKind::Map:
-            nextBuffer();
-            skipField(field.type.children.at(0));
+            consume_buffer(rows ? rows + 1 : 0, type.kind == TypeKind::LargeList ? sizeof(Int64) : sizeof(Int32), "offsets");
+            advanceField(type.children.at(0), validate_lengths);
             break;
-        /// FixedSizeList: no buffer of its own beyond validity, only the child subtree.
         case TypeKind::FixedSizeList:
-            skipField(field.type.children.at(0));
+            if (validate_lengths)
+                expectNextNodeLength(fixedSizeListChildRows(type, rows), "fixed-size-list child");
+            advanceField(type.children.at(0), validate_lengths);
             break;
-        /// Struct: no buffer of its own beyond validity, only the child subtrees.
         case TypeKind::Struct:
-            for (const ArrowField & child : field.type.children)
-                skipField(child);
+            for (const ArrowField & child : type.children)
+            {
+                if (validate_lengths)
+                    expectNextNodeLength(rows, fmt::format("struct field '{}'", child.name));
+                advanceField(child, validate_lengths);
+            }
             break;
         case TypeKind::Null:
         case TypeKind::Union:
-            break; /// handled above
+            break; /// These layouts are handled before the validity buffer.
         case TypeKind::Unsupported:
-            /// ListView/LargeListView: an offsets buffer and a sizes buffer (after the validity buffer
-            /// consumed above), then the single child. The reader cannot decode these, but skipping an
-            /// unrequested one keeps the other columns readable. (RunEndEncoded is handled before the
-            /// validity buffer above, so it never reaches here.)
-            if (field.type.skip_layout == ArrowType::SkipLayout::ListView)
+            /// List views can be skipped when unrequested; their values are not supported by the decoder.
+            if (type.skip_layout == ArrowType::SkipLayout::ListView)
             {
-                nextBuffer(); /// offsets
-                nextBuffer(); /// sizes
-                skipField(field.type.children.at(0));
+                nextBuffer();
+                nextBuffer();
+                advanceField(type.children.at(0), validate_lengths);
                 break;
             }
-            /// The buffer layout of any other unsupported Arrow type is unknown, so its buffers cannot be
-            /// skipped to reach later columns. A `SELECT` of other columns from a file with such an
-            /// (unrequested) column therefore still fails — but with a clear error rather than a cursor
-            /// desync.
             throw Exception(
                 ErrorCodes::NOT_IMPLEMENTED,
                 "Native Arrow IPC reader cannot skip the unsupported Arrow type {} of field '{}'",
-                field.type.unsupported_type_name, field.name);
+                type.unsupported_type_name, field.name);
     }
 }
 
@@ -1849,7 +1820,7 @@ RecordBatchDecoder::DecodedColumns RecordBatchDecoder::decodeBatch(
         if (keep_top_level_fields && !keep_top_level_fields->contains(normalized_name))
         {
             /// Skip unrequested values after validating the column's root row count.
-            skipField(field);
+            advanceField(field);
             continue;
         }
         /// `normalized_name` seeds the requested-type lookup in `target_types`.
@@ -1937,6 +1908,15 @@ RecordBatchDecoder::DecodedColumn RecordBatchDecoder::decodeBatchColumn(
     else
     {
         checkRowCountWithinBody(batch_rows, fmt::format("column '{}'", field.name));
+        /// Validate the complete subtree before allocating columns or visibility masks. A buffered
+        /// descendant must justify its row count before any preceding bufferless sibling is materialized.
+        const size_t first_node = node_index;
+        const size_t first_buffer = buffer_index;
+        const size_t first_variadic = variadic_index;
+        advanceField(field, /*validate_lengths=*/true);
+        node_index = first_node;
+        buffer_index = first_buffer;
+        variadic_index = first_variadic;
         decoded.column = decodeField(
             field,
             /*allow_low_cardinality=*/true,
@@ -2011,7 +1991,7 @@ void RecordBatchDecoder::prepareBuffers(const flatbuf::RecordBatch & batch, cons
         for (size_t i = 0; i < num_buffers; ++i)
         {
             /// Unreachable buffer (subset read): it was not read into `body`. Emit a placeholder slice
-            /// without validating it or pointing at its absolute offset; `skipField` consumes it unread.
+            /// without validating it or pointing at its absolute offset; `advanceField` consumes it unread.
             if (reachable && !(*reachable)[i])
             {
                 buffer_slices.push_back(Slice{nullptr, 0});
@@ -2184,9 +2164,8 @@ VectorWithMemoryTracking<char> RecordBatchDecoder::reachableTopLevelBuffers(
 
     VectorWithMemoryTracking<char> reachable(num_buffers, 0);
 
-    /// Walk the schema with the decoder's own cursor logic (`skipField`) so the buffer spans match decoding
-    /// exactly. No body is needed: buffer counts come from the field types and the batch's variadic counts.
-    /// `buffer_slices` must be addressable for `nextBuffer()` during the walk, but the slices are never read.
+    /// Walk the schema with `advanceField` so buffer spans match decoding. Counts come from field types
+    /// and variadic counts; the body is not read. Placeholder slices let `nextBuffer` advance the cursor.
     current_batch = &batch;
     node_index = 0;
     buffer_index = 0;
@@ -2209,7 +2188,7 @@ VectorWithMemoryTracking<char> RecordBatchDecoder::reachableTopLevelBuffers(
         for (const ArrowField & field : schema.fields)
         {
             const size_t start = buffer_index;
-            skipField(field);
+            advanceField(field);
             const size_t end = buffer_index;
             if (keep_top_level_fields->contains(normalizedName(field.name)))
             {
@@ -2253,12 +2232,12 @@ void RecordBatchDecoder::validateBatchLayout(const flatbuf::RecordBatch & batch,
             variadic_counts.push_back(c);
         }
     }
-    /// `skipField` pops slices via `nextBuffer`; give it placeholders so the cursor can advance. A batch
+    /// `advanceField` pops slices via `nextBuffer`; give it placeholders so the cursor can advance. A batch
     /// declaring fewer buffers than the field needs makes `nextBuffer` throw here, before any materialization.
     buffer_slices.assign(total_buffers, Slice{});
 
     for (const ArrowField & field : fields)
-        skipField(field);
+        advanceField(field);
 
     const bool exact = node_index == total_nodes && buffer_index == total_buffers
         && variadic_index == variadic_counts.size();
