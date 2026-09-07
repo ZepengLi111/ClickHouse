@@ -14,7 +14,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 # the message body could hold while every FieldNode length stays consistent. When that child is a struct
 # whose first field is a `null` array and whose second is buffered, the `null` field would be sized by the
 # declared count before the buffered field's buffer-size check could notice the batch is corrupt. The
-# reader therefore rejects a child count beyond the body's physical bound before decoding the child.
+# reader therefore checks the root and its buffered child's physical row bounds before decoding.
 #
 # The stream below holds fixed_size_list<struct<n: null, v: int32>, 3> with 5 rows (15 elements). Its
 # forged variant patches every int64 equal to 5 to 2^36 and every int64 equal to 15 to 3 * 2^36 — the batch
@@ -55,6 +55,6 @@ echo "--- the forged stream ---"
 err=$(${CLICKHOUSE_LOCAL} --max_memory_usage=1G --query "SELECT a FROM file('${TMP_DIR}/fsl_forged.arrows', 'ArrowStream', '${STRUCTURE}') FORMAT Null" 2>&1)
 case "$err" in
     *CANNOT_ALLOCATE_MEMORY*|*"bad_alloc"*|*MEMORY_LIMIT_EXCEEDED*) echo "the forged count drove an allocation" ;;
-    *"fixed-size-list child declares "*"more than the "*"message body can hold"*) echo "rejected by the physical bound of the body" ;;
+    *"column 'a' declares "*"more than the "*"message body can hold"*) echo "rejected by the physical bound of the body" ;;
     *) echo "unexpected outcome: ${err}" ;;
 esac

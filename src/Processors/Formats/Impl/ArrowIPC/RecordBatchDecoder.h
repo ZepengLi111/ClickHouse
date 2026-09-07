@@ -148,10 +148,9 @@ inline const NullMap * unionNullMaps(const NullMap & own, const NullMap * other,
 }
 
 /// Decodes Arrow IPC record batches directly into ClickHouse columns, without the Apache Arrow library.
-/// Supports flat and nested (Array/Tuple/Map) types, LowCardinality (dictionary-encoded) fields, and
-/// uncompressed bodies. The decoder walks the pre-ordered flattened `nodes` (FieldNode) and `buffers`
-/// lists exactly as laid out by the Arrow columnar specification and slices the single message body,
-/// bounds-checking every access.
+/// Supports nested types, dictionary encoding, and uncompressed, LZ4, or Zstd bodies. The decoder walks
+/// the flattened `FieldNode` and buffer lists in schema order and validates their declared sizes before
+/// materializing columns.
 class RecordBatchDecoder
 {
 public:
@@ -176,16 +175,12 @@ public:
         Int64 length = 0;
     };
 
-    /// Decodes the schema's fields from one record batch and its full message body. When
-    /// `keep_top_level_fields` is set, only the named top-level fields are decoded; the others are skipped
-    /// (their buffers consumed but not materialized), so a `SELECT` of a subset of columns does not pay
-    /// for — or fail on — unrequested columns. The set holds field names normalized the same way the
-    /// reader matches them to the header (lower-cased when case-insensitive matching is on).
-    /// `target_types` maps each requested column's normalized name (including dotted subcolumn names like
-    /// `t.d`) to its requested ClickHouse type. The decoder uses it to read a `date32` mapped to a numeric
-    /// target as the raw `Int32` day number without the `Date32` range/overflow check — recursively, so a
-    /// `date32` nested in an Array/Tuple/Map or addressed as a subcolumn is handled too — matching the
-    /// Apache Arrow library reader's recursive numeric type-hint behavior.
+    /// Decodes requested fields from a record batch, validating every root node's row count. When
+    /// `keep_top_level_fields` is set, only the named fields have their values decoded; other fields are
+    /// skipped. Names are normalized according to the reader's case-insensitive matching setting.
+    /// `target_types` maps normalized column names, including dotted subcolumn names, to requested types.
+    /// These hints guide numeric `date32` decoding, raw-byte reinterpretation, and struct nullability at
+    /// every nesting level, following the same rules as the Apache Arrow library reader.
     /// `reachable_buffers`, when set, is a 0/1 mask (see `reachableTopLevelBuffers`) marking the buffers the
     /// requested columns reference; the rest are neither validated nor materialized (they are not in `body`).
     DecodedColumns decodeBatch(
@@ -231,14 +226,12 @@ public:
 private:
     Slice nextBuffer();
     const flatbuf::FieldNode & nextNode();
-    /// The FieldNode `offset` nodes past the next one, without consuming anything.
+    /// Returns the `FieldNode` at `offset` from the next node without consuming it.
     const flatbuf::FieldNode & peekNode(size_t offset) const;
-    /// Length of the next FieldNode without consuming it (for validating a child before decoding it).
+    /// Returns the next `FieldNode` length without consuming it.
     Int64 peekNextNodeLength() const;
-    /// Rejects the next FieldNode unless it declares exactly `expected` rows, BEFORE it is decoded: a
-    /// buffer-less field is sized by that length alone, so a forged length would otherwise drive an
-    /// allocation of that size before any post-decode size check could fire. `what` names the field in the
-    /// error, e.g. "struct field 'x'".
+    /// Validates the next node's row count before decoding or skipping it. `what` identifies the field
+    /// in the error message.
     void expectNextNodeLength(size_t expected, const String & what) const;
     /// Rejects the next FieldNode unless it declares at least `minimum` rows: the child of an offsets parent
     /// (List/LargeList/Map) must cover the rows the offsets reference, while a longer one is legal — a
@@ -251,11 +244,9 @@ private:
     /// `decodeField` consumes the node.
     size_t peekNodeRows() const;
 
-    /// Rejects a declared row count the message body cannot physically hold, BEFORE the field is decoded:
-    /// any row of a field that undergoes value decoding occupies at least one bit in some buffer, so a
-    /// count above the body's total bits is forged, and a buffer-less field declared ahead of its buffered
-    /// siblings would otherwise allocate for it before any of their buffer-size checks fires. `what` names
-    /// the field in the error, e.g. "list child".
+    /// Checks that a buffered subtree's declared row count fits the body's total bits before decoding.
+    /// This also bounds allocations for bufferless fields declared ahead of their buffered siblings.
+    /// `what` identifies the field in the error message.
     void checkRowCountWithinBody(size_t rows, const String & what) const;
 
     /// The invisible-rows mask for the child of a List/LargeList/Map field, sized to the child's declared
@@ -274,15 +265,10 @@ private:
     /// The recursive walk of `isSizeDeterminedSubtree` over the nodes of a buffer-less subtree. `node_offset`
     /// is the subtree's first node relative to the next node and is advanced past the subtree.
     bool bufferlessSubtreeDeclaresNulls(const ArrowField & field, size_t & node_offset) const;
-    /// Builds the column a size-determined subtree (see `isSizeDeterminedSubtree`) decodes to, at `rows`
-    /// rows instead of the rows its first node declares, consuming its nodes and the validity slots of its
-    /// struct and fixed-size-list nodes exactly as `decodeField` would. A parent that keeps only some of the
-    /// subtree's rows — an offsets parent dropping the ranges under invisible slots and the unreferenced
-    /// head and tail of a sliced list — builds just those, never materializing the declared length, however
-    /// large the offsets make it. Nested nodes are still checked against the lengths the decoding path
-    /// requires of them, so inconsistent metadata is rejected the same way on both paths; the caller has
-    /// validated the first node's length. `target_hint`, `path` and `list_depth` are the subtree's
-    /// requested-type position (see `decodeField`) and decide only whether a struct is wrapped in Nullable.
+    /// Builds a bufferless subtree with `rows` materialized values after the caller validates its root
+    /// length. Child lengths and buffer slots are still consumed according to the declared layout.
+    /// A root can materialize one value for `ColumnConst`; a list child can materialize only the elements
+    /// referenced by visible slots. Requested type hints determine whether structs retain `Nullable`.
     ColumnPtr buildSizeDeterminedColumn(
         const ArrowField & field, size_t rows, const DataTypePtr & target_hint, const String & path, size_t list_depth);
 
@@ -345,18 +331,17 @@ private:
 
     void prepareBuffers(const flatbuf::RecordBatch & batch, const PODArray<char> & body, const VectorWithMemoryTracking<char> * reachable);
 
-    /// Per-batch setup shared by `decodeBatch` and `decodeDictionaryValues`: points the node/buffer cursors
-    /// at `batch`, validates its variadic buffer counts and its length, and slices `body` into
-    /// `buffer_slices` (see `prepareBuffers`). `target_types_` are the requested types looked up by dotted
-    /// column name while this batch decodes (null: no lookups).
+    /// Initializes shared state for `decodeBatch` and `decodeDictionaryValues`, validating the batch length
+    /// and variadic buffer counts before `prepareBuffers` slices the body. `target_types_` supplies the
+    /// requested types looked up by column name during decoding.
     void beginBatch(
         const flatbuf::RecordBatch & batch, const PODArray<char> & body,
         const VectorWithMemoryTracking<char> * reachable_buffers,
         const UnorderedMapWithMemoryTracking<String, DataTypePtr> * target_types_);
-    /// Decodes one column of the current batch (its node is the next one) after checking that it declares
-    /// the batch's row count, and declares it by its ClickHouse type. `target_hint`, `path` and `list_depth`
-    /// are the column's requested-type position (see `decodeField`): a record batch column sits at the top
-    /// level, a dictionary's values at the position of the field encoding the dictionary.
+    /// Decodes one column of the current batch after the caller has validated its root node's row count,
+    /// and reports its ClickHouse type. `target_hint`, `path`, and `list_depth` describe the requested-type
+    /// position used by `decodeField`: a record batch column sits at the top level, and dictionary values
+    /// sit at the position of the field encoding the dictionary.
     DecodedColumn decodeBatchColumn(
         const ArrowField & field, const DataTypePtr & target_hint, const String & path, size_t list_depth,
         ColumnUInt8::Ptr * decoded_null_map = nullptr);

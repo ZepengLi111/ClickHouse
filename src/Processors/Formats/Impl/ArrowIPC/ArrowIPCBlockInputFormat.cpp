@@ -4,6 +4,7 @@
 
 #include <Formats/FormatFactory.h>
 #include <Processors/Port.h>
+#include <Processors/Formats/IRowInputFormat.h>
 #include <Processors/Formats/Impl/ArrowGeoTypes.h>
 #include <Processors/Formats/Impl/ArrowIPC/ArrowIPCSchemaReader.h>
 #include <Common/WKB.h>
@@ -97,9 +98,10 @@ bool arrowTypesEqual(const ArrowIPC::ArrowType & a, const ArrowIPC::ArrowType & 
 }
 
 ArrowIPCBlockInputFormat::ArrowIPCBlockInputFormat(
-    ReadBuffer & in_, SharedHeader header_, bool stream_, const FormatSettings & format_settings_)
+    ReadBuffer & in_, SharedHeader header_, bool stream_, size_t max_block_size_, const FormatSettings & format_settings_)
     : IInputFormat(header_, &in_)
     , stream(stream_)
+    , max_block_size(max_block_size_)
     , block_missing_values(getPort().getHeader().columns())
     , format_settings(format_settings_)
 {
@@ -1033,18 +1035,18 @@ Chunk ArrowIPCBlockInputFormat::buildChunk(ArrowIPC::RecordBatchDecoder::Decoded
     return Chunk(std::move(columns), num_rows);
 }
 
-Chunk ArrowIPCBlockInputFormat::readStream()
+bool ArrowIPCBlockInputFormat::readStreamBatch()
 {
     const size_t batch_start = in->count();
 
-    while (true)
+    while (!is_stopped)
     {
         ArrowIPC::MessageReader::Message msg;
         if (!message_reader->readNextMessage(msg))
         {
             /// Drain the buffer so the underlying stream is fully consumed (HTTP keepalive, etc.).
             in->eof();
-            return {};
+            return false;
         }
 
         switch (msg.header->header_type())
@@ -1054,25 +1056,23 @@ Chunk ArrowIPCBlockInputFormat::readStream()
                 const auto * batch = msg.header->header_as_RecordBatch();
                 if (batch->length() < 0)
                     throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow IPC record batch has a negative length {}", batch->length());
-                const size_t num_rows = static_cast<size_t>(batch->length());
+                batch_rows = static_cast<size_t>(batch->length());
 
                 if (need_only_count)
                 {
                     message_reader->skipBody(msg.body_length);
-                    return getChunkForCount(num_rows);
+                }
+                else
+                {
+                    /// Read only the body buffers needed by requested columns, skipping all other ranges.
+                    const auto reachable = decoder->reachableTopLevelBuffers(*batch, &requested_top_level_fields);
+                    message_reader->readBody(*batch, msg.body_length, body_buffer, &reachable);
+                    decoded_batch = decoder->decodeBatch(
+                        *batch, body_buffer, &requested_top_level_fields, &requested_field_target_types, &reachable);
                 }
 
-                /// Subset read: read, validate and decompress only the buffers the requested columns
-                /// reference; unrequested columns' body ranges are skipped (see `readBody`).
-                const auto reachable = decoder->reachableTopLevelBuffers(*batch, &requested_top_level_fields);
-                message_reader->readBody(*batch, msg.body_length, body_buffer, &reachable);
-                auto decoded = decoder->decodeBatch(*batch, body_buffer, &requested_top_level_fields, &requested_field_target_types, &reachable);
-                Chunk chunk = buildChunk(decoded, num_rows);
-
-                const size_t batch_end = in->count();
-                if (batch_end > batch_start)
-                    approx_bytes_read_for_chunk = batch_end - batch_start;
-                return chunk;
+                approx_bytes_read_for_chunk += in->count() - batch_start;
+                return true;
             }
             case ArrowIPC::flatbuf::MessageHeader_DictionaryBatch:
             {
@@ -1106,12 +1106,13 @@ Chunk ArrowIPCBlockInputFormat::readStream()
                 continue;
         }
     }
+    return false;
 }
 
-Chunk ArrowIPCBlockInputFormat::readFile()
+bool ArrowIPCBlockInputFormat::readFileBatch()
 {
     if (record_batch_current >= record_batch_blocks.size())
-        return {};
+        return false;
 
     const BlockInfo & block = record_batch_blocks[record_batch_current++];
     seekable->seek(block.offset, SEEK_SET);
@@ -1131,30 +1132,79 @@ Chunk ArrowIPCBlockInputFormat::readFile()
     const auto * batch = msg.header->header_as_RecordBatch();
     if (batch->length() < 0)
         throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow IPC record batch has a negative length {}", batch->length());
-    const size_t num_rows = static_cast<size_t>(batch->length());
+    batch_rows = static_cast<size_t>(batch->length());
 
+    if (!need_only_count)
+    {
+        /// Read only the body buffers needed by requested columns, skipping all other ranges.
+        const auto reachable = decoder->reachableTopLevelBuffers(*batch, &requested_top_level_fields);
+        message_reader->readBody(*batch, msg.body_length, body_buffer, &reachable);
+        decoded_batch = decoder->decodeBatch(
+            *batch, body_buffer, &requested_top_level_fields, &requested_field_target_types, &reachable);
+    }
+
+    approx_bytes_read_for_chunk += block.metadata_length + block.body_length;
+    return true;
+}
+
+Chunk ArrowIPCBlockInputFormat::generateChunkFromBatch()
+{
     if (need_only_count)
-        return getChunkForCount(num_rows);
+    {
+        batch_offset = batch_rows;
+        return getChunkForCount(batch_rows);
+    }
 
-    /// Subset read: read, validate and decompress only the buffers the requested columns reference;
-    /// unrequested columns' body ranges are skipped (see `readBody`).
-    const auto reachable = decoder->reachableTopLevelBuffers(*batch, &requested_top_level_fields);
-    message_reader->readBody(*batch, msg.body_length, body_buffer, &reachable);
-    auto decoded = decoder->decodeBatch(*batch, body_buffer, &requested_top_level_fields, &requested_field_target_types, &reachable);
+    /// Ordinary columns already occupy memory for the whole batch and can be moved without copying.
+    /// Batches containing only constants need a row limit before those constants or defaults expand.
+    const bool all_constant = std::ranges::all_of(decoded_batch, [](const auto & column)
+    {
+        return isColumnConst(*column.column);
+    });
+    const size_t remaining_rows = batch_rows - batch_offset;
+    const size_t num_rows = all_constant ? std::min(max_block_size, remaining_rows) : remaining_rows;
+    ArrowIPC::RecordBatchDecoder::DecodedColumns decoded;
+    if (num_rows == batch_rows)
+    {
+        decoded = std::move(decoded_batch);
+    }
+    else
+    {
+        decoded.reserve(decoded_batch.size());
+        for (const auto & column : decoded_batch)
+            decoded.push_back({column.name, column.type, column.column->cut(batch_offset, num_rows)});
+    }
+    batch_offset += num_rows;
+    if (batch_offset == batch_rows)
+        decoded_batch.clear();
+
+    /// Constants expand after deciding whether the batch requires slicing.
+    for (auto & column : decoded)
+        column.column = column.column->convertToFullColumnIfConst();
     return buildChunk(decoded, num_rows);
 }
 
 Chunk ArrowIPCBlockInputFormat::read()
 {
     block_missing_values.clear();
+    approx_bytes_read_for_chunk = 0;
 
     if (!prepared)
         prepareReader();
 
-    if (is_stopped)
-        return {};
+    while (!is_stopped)
+    {
+        if (batch_offset < batch_rows)
+            return generateChunkFromBatch();
 
-    return stream ? readStream() : readFile();
+        decoded_batch.clear();
+        batch_rows = 0;
+        batch_offset = 0;
+        if (!(stream ? readStreamBatch() : readFileBatch()))
+            return {};
+    }
+    decoded_batch.clear();
+    return {};
 }
 
 const BlockMissingValues * ArrowIPCBlockInputFormat::getMissingValues() const
@@ -1173,6 +1223,9 @@ void ArrowIPCBlockInputFormat::resetParser()
     dictionary_value_fields.clear();
     dictionary_uses.clear();
     dictionaries.clear();
+    decoded_batch.clear();
+    batch_rows = 0;
+    batch_offset = 0;
     record_batch_blocks.clear();
     record_batch_current = 0;
     seekable = nullptr;
@@ -1189,20 +1242,22 @@ void registerInputFormatArrow(FormatFactory & factory)
         "Arrow",
         [](ReadBuffer & buf,
            const Block & sample,
-           const RowInputFormatParams & /* params */,
+           const RowInputFormatParams & params,
            const FormatSettings & format_settings) -> InputFormatPtr
         {
-            return std::make_shared<ArrowIPCBlockInputFormat>(buf, std::make_shared<const Block>(sample), false, format_settings);
+            return std::make_shared<ArrowIPCBlockInputFormat>(
+                buf, std::make_shared<const Block>(sample), false, params.max_block_size_rows, format_settings);
         });
     factory.markFormatSupportsSubsetOfColumns("Arrow");
     factory.registerInputFormat(
         "ArrowStream",
         [](ReadBuffer & buf,
            const Block & sample,
-           const RowInputFormatParams & /* params */,
+           const RowInputFormatParams & params,
            const FormatSettings & format_settings) -> InputFormatPtr
         {
-            return std::make_shared<ArrowIPCBlockInputFormat>(buf, std::make_shared<const Block>(sample), true, format_settings);
+            return std::make_shared<ArrowIPCBlockInputFormat>(
+                buf, std::make_shared<const Block>(sample), true, params.max_block_size_rows, format_settings);
         });
     factory.markFormatSupportsSubsetOfColumns("ArrowStream");
 

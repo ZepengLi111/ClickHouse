@@ -339,7 +339,7 @@ void RecordBatchDecoder::expectNextNodeLengthAtLeast(size_t minimum, const Strin
 
 void RecordBatchDecoder::checkRowCountWithinBody(size_t rows, const String & what) const
 {
-    if (rows > total_buffer_bytes * 8)
+    if (rows / 8 + (rows % 8 != 0) > total_buffer_bytes)
         throw Exception(
             ErrorCodes::INCORRECT_DATA,
             "Arrow IPC {} declares {} rows, more than the {}-byte message body can hold", what, rows, total_buffer_bytes);
@@ -412,13 +412,8 @@ DataTypePtr resolveHint(
     return hint;
 }
 
-/// Whether a field's decoded size derives from FieldNode lengths alone, with no buffer whose validated
-/// size bounds the declared row count. A `null`-typed field carries no buffers at all; a struct or
-/// fixed-size-list tree of such fields adds only validity buffers, which may legitimately be absent
-/// (0 bytes) when the nodes declare no nulls. Every other layout carries a values/offsets/type-ids/
-/// indices buffer that `checkBufferSize` validates against the declared length before any allocation
-/// (a dictionary-encoded field is physically an index array, whatever its value type is). A forged
-/// length on a buffer-less subtree must therefore be bounded by its parent BEFORE decoding it.
+/// A `Null` field has no buffers. A struct or fixed-size-list tree of such fields needs only optional
+/// validity buffers, so its logical row count can be independent of the message body size.
 bool isBufferlessSubtree(const ArrowField & field)
 {
     if (field.dictionary)
@@ -1860,16 +1855,16 @@ RecordBatchDecoder::DecodedColumns RecordBatchDecoder::decodeBatch(
     result.reserve(schema.fields.size());
     for (const ArrowField & field : schema.fields)
     {
+        expectNextNodeLength(static_cast<size_t>(batch.length()), fmt::format("column '{}'", field.name));
         const String normalized_name = normalizedName(field.name);
         if (keep_top_level_fields && !keep_top_level_fields->contains(normalized_name))
         {
-            /// Unrequested column: advance the node/buffer cursors past it without decoding, so a
-            /// SELECT of a subset of columns neither pays for nor fails on columns it did not request.
+            /// Skip unrequested values after validating the column's root row count.
             skipField(field);
             continue;
         }
-        /// `normalized_name` seeds the recursive `date32` numeric type hint (looked up in `target_types`);
-        /// nested fields derive their hints from it as the decoder recurses. See decodeField/decodeInner.
+        /// `normalized_name` seeds the requested-type lookup in `target_types`.
+        /// Nested fields derive their hints through `decodeField` and `decodeInner`.
         result.push_back(decodeBatchColumn(field, /*target_hint=*/nullptr, normalized_name, /*list_depth=*/0));
     }
 
@@ -1882,6 +1877,7 @@ DictionaryRegistry::Values RecordBatchDecoder::decodeDictionaryValues(
     const UnorderedMapWithMemoryTracking<String, DataTypePtr> * target_types_)
 {
     beginBatch(batch, body, /*reachable_buffers=*/nullptr, target_types_);
+    expectNextNodeLength(static_cast<size_t>(batch.length()), fmt::format("column '{}'", value_field.name));
     ColumnUInt8::Ptr null_map;
     DecodedColumn values = decodeBatchColumn(value_field, use.hint, use.position.path, use.position.list_depth, &null_map);
     finishBatch();
@@ -1896,6 +1892,9 @@ void RecordBatchDecoder::beginBatch(
     const VectorWithMemoryTracking<char> * reachable_buffers,
     const UnorderedMapWithMemoryTracking<String, DataTypePtr> * target_types_)
 {
+    if (batch.length() < 0)
+        throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow IPC record batch has a negative length {}", batch.length());
+
     target_types = target_types_;
     current_batch = &batch;
     node_index = 0;
@@ -1914,13 +1913,6 @@ void RecordBatchDecoder::beginBatch(
         }
     }
 
-    /// The batch length is untrusted IPC metadata; reject a negative one before `prepareBuffers`, so a
-    /// negative length on the dictionary-batch path is rejected before any (possibly large or compressed)
-    /// buffer is allocated or decompressed from the batch metadata. Each top-level column's declared row
-    /// count is then checked against this length (`decodeBatchColumn`) before the column is decoded.
-    if (batch.length() < 0)
-        throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow IPC record batch has a negative length {}", batch.length());
-
     prepareBuffers(batch, body, reachable_buffers);
 }
 
@@ -1928,24 +1920,12 @@ RecordBatchDecoder::DecodedColumn RecordBatchDecoder::decodeBatchColumn(
     const ArrowField & field, const DataTypePtr & target_hint, const String & path, size_t list_depth,
     ColumnUInt8::Ptr * decoded_null_map)
 {
-    /// Every column of a batch must decode to the batch's row count; otherwise the returned `Chunk` would
-    /// mix columns of different sizes (an internal inconsistency) instead of being rejected as bad data.
-    /// Reject a mismatch BEFORE decodeField: a buffer-less column (a `null`-typed field, or a
-    /// struct/fixed-size-list tree of them) is sized by its FieldNode length alone, so a forged length
-    /// would otherwise drive an allocation of that size before any consistency check fired.
     const size_t batch_rows = static_cast<size_t>(current_batch->length());
-    const Int64 declared_rows = peekNextNodeLength();
-    if (declared_rows < 0 || static_cast<size_t>(declared_rows) != batch_rows)
-        throw Exception(
-            ErrorCodes::INCORRECT_DATA,
-            "Arrow IPC column '{}' declares {} rows, expected the batch length {}", field.name, declared_rows, batch_rows);
 
     DecodedColumn decoded;
     decoded.name = field.name;
-    /// A dictionary-encoded field is declared by its registered value type — the type its dictionary batch
-    /// was decoded to for this field's position (see `DictionaryRegistry::Values`), under the field's own
-    /// nullability (see `dictionaryValuesFor`), which is what `decodeDictionary` builds the column from —
-    /// rather than by its natural type; a top-level field decodes into a LowCardinality column of that type.
+    /// Dictionary values retain the type produced by their requested hints. The referencing field
+    /// determines whether that type keeps its outer `Nullable` wrapper.
     if (field.dictionary)
     {
         const auto & dictionary = registry.get(field.dictionary->id, FieldPosition{path, list_depth});
@@ -1956,30 +1936,38 @@ RecordBatchDecoder::DecodedColumn RecordBatchDecoder::decodeBatchColumn(
     }
     else
         decoded.type = fieldToCHType(field, settings, field.nullable, /*allow_null_type=*/true);
-    decoded.column = decodeField(
-        field,
-        /*allow_low_cardinality=*/true,
-        target_hint,
-        path,
-        list_depth,
-        /*invisible_rows=*/nullptr,
-        decoded_null_map);
-    /// `decodeField` may wrap a struct in Nullable based on the requested type hint even when
-    /// `fieldToCHType` did not (setting off); reconcile the reported type with the decoded column so the
-    /// column/type pair stays consistent for the subsequent cast.
+    /// Bufferless roots store one physical value. The reader chooses the output row count before
+    /// expanding it, and dictionaries retain its compact representation across deltas.
+    const bool constant = batch_rows != 0 && isSizeDeterminedSubtree(field);
+    if (constant)
+    {
+        decoded.column = buildSizeDeterminedColumn(field, 1, target_hint, path, list_depth);
+        if (decoded_null_map && field.type.kind == TypeKind::Null)
+            *decoded_null_map = assert_cast<const ColumnNullable &>(*decoded.column).getNullMapColumn().getPtr();
+    }
+    else
+    {
+        checkRowCountWithinBody(batch_rows, fmt::format("column '{}'", field.name));
+        decoded.column = decodeField(
+            field,
+            /*allow_low_cardinality=*/true,
+            target_hint,
+            path,
+            list_depth,
+            /*invisible_rows=*/nullptr,
+            decoded_null_map);
+    }
+    /// A requested nullable tuple can add a wrapper beyond the schema's natural type.
     decoded.type = matchColumnNullability(decoded.type, decoded.column);
+    if (constant)
+        decoded.column = ColumnConst::create(decoded.column, batch_rows);
     return decoded;
 }
 
 void RecordBatchDecoder::finishBatch()
 {
-    /// Verify the layout math is exact: every FieldNode, buffer and variadic-buffer count the batch declares
-    /// must have been consumed by the decoded-or-skipped fields. This must run whether or not columns were
-    /// pruned: when pruning, a mismatch means `skipField` mis-counted a layout; when every column is decoded,
-    /// a surplus (e.g. an extra in-bounds buffer interposed before a requested column) would otherwise make
-    /// the decoder read a column from the injected buffer and silently ignore the real trailing buffer. Fail
-    /// loudly here rather than risk reading a column from the wrong buffer. (Dictionary value batches get the
-    /// same exactness from `validateBatchLayout`.)
+    /// Decoded and skipped fields must consume every declared node, buffer, and variadic count.
+    /// Surplus entries indicate that the batch layout does not match the schema.
     const size_t total_nodes = current_batch->nodes() ? current_batch->nodes()->size() : 0;
     if (node_index != total_nodes || buffer_index != buffer_slices.size() || variadic_index != variadic_counts.size())
         throw Exception(
