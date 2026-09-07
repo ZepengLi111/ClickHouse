@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest
+# Tags: long, no-fasttest
 # no-fasttest: needs the pyarrow Python module to build the Arrow files.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
