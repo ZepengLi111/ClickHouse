@@ -1500,7 +1500,7 @@ using AliasMap = UnorderedMapWithMemoryTracking<std::string_view, std::string_vi
 
 
 /// Generates the alias mapping entries of a setting: one `{ alias, name }` pair per alias.
-/// A setting declared with DECLARE_WITH_ALIAS can list one or two aliases after its flags.
+/// A setting declared with `DECLARE_WITH_ALIAS` can list one or two aliases after its flags.
 /// NOLINTNEXTLINE
 #define DECLARE_SETTINGS_WITH_ALIAS_TRAITS_(TYPE, NAME, DEFAULT, DESCRIPTION, FLAGS, ...) \
     SETTINGS_ALIAS_ENTRIES_(NAME, __VA_ARGS__)
