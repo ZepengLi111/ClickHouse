@@ -707,8 +707,8 @@ constexpr bool isInnerOrCross(JoinKind kind)
 static bool conflictDetectorReordersSemiAnti(const QueryPlanOptimizationSettings & optimization_settings)
 {
     const auto & algorithms = optimization_settings.query_plan_optimize_join_order_algorithm;
-    return (optimization_settings.query_plan_optimize_join_order_use_cd_a_conflict_detector
-            || optimization_settings.query_plan_optimize_join_order_use_cd_c_conflict_detector)
+    return (optimization_settings.query_plan_optimize_join_order_use_conflict_detector_a
+            || optimization_settings.query_plan_optimize_join_order_use_conflict_detector_c)
         && algorithms.size() == 1
         && algorithms.front() == JoinOrderAlgorithm::DPSUB;
 }
@@ -1319,8 +1319,8 @@ static QueryPlan::Node chooseJoinOrder(QueryGraphBuilder query_graph_builder, Qu
             /// the graph may mix strictnesses (e.g. inner joins around a reordered semi/anti join),
             /// and each entry already carries its own strictness from `buildPhysicalPlan` -- do not
             /// overwrite it.
-            if (!optimization_settings.query_plan_optimize_join_order_use_cd_a_conflict_detector
-                && !optimization_settings.query_plan_optimize_join_order_use_cd_c_conflict_detector)
+            if (!optimization_settings.query_plan_optimize_join_order_use_conflict_detector_a
+                && !optimization_settings.query_plan_optimize_join_order_use_conflict_detector_c)
                 join_operator.strictness = join_strictness;
 
             /// The optimizer reconstructs an unconnected Inner pair (e.g. `INNER JOIN ... ON 1`,

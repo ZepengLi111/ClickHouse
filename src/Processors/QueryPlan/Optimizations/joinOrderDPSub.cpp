@@ -71,11 +71,11 @@ private:
 
     bool useConflictDetector() const
     {
-        return query_graph.use_cd_a_conflict_detector || query_graph.use_cd_c_conflict_detector;
+        return query_graph.use_conflict_detector_a || query_graph.use_conflict_detector_c;
     }
     ConflictDetector conflictDetectorKind() const
     {
-        return query_graph.use_cd_c_conflict_detector ? ConflictDetector::CDC : ConflictDetector::CDA;
+        return query_graph.use_conflict_detector_c ? ConflictDetector::CDC : ConflictDetector::CDA;
     }
 
     const std::vector<JoinActionRef *> & collectJoinEdgesMask(UInt32 left_mask, UInt32 right_mask);
@@ -176,7 +176,7 @@ void DPSubJoinOrderOptimizer::initDPsubScratch()
 
         dpsub_data.conflict_operators = computeConflictOperators(ops, conflictDetectorKind(), log);
         LOG_TRACE(log, "DPsub: using {} conflict detector over {} captured join operators",
-                  query_graph.use_cd_c_conflict_detector ? "CD-C" : "CD-A", dpsub_data.conflict_operators.size());
+                  query_graph.use_conflict_detector_c ? "CD-C" : "CD-A", dpsub_data.conflict_operators.size());
     }
     else
     {

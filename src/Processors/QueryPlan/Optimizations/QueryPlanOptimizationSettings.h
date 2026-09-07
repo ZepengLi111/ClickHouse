@@ -101,8 +101,8 @@ struct QueryPlanOptimizationSettings
     /// Conflict detectors for join reordering validity in the
     /// DPsub algorithm, instead of the default per-relation ON-clause restriction. CD-A is correct
     /// but incomplete; CD-C is correct and complete. CD-C takes precedence when both are set.
-    bool query_plan_optimize_join_order_use_cd_a_conflict_detector = false;
-    bool query_plan_optimize_join_order_use_cd_c_conflict_detector = false;
+    bool query_plan_optimize_join_order_use_conflict_detector_a = false;
+    bool query_plan_optimize_join_order_use_conflict_detector_c = false;
 
     /// Infer transitive equi-join predicates (e.g., A.x=B.x AND B.x=C.x implies A.x=C.x)
     bool enable_join_transitive_predicates = false;
