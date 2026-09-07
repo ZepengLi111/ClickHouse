@@ -22,7 +22,8 @@
     <!-- top-level: a tiny path 'small' next to a large path 'big' in the same bucket -->
     <fill_query>insert into json_advanced_shared_data_top select map('small', toString(number % 100), 'big', hex(randomString(4000))) from numbers(1000000)</fill_query>
     <!-- nested: one Array(JSON) path 'items' whose objects have a large 'big' and a tiny 'small' -->
-    <fill_query>insert into json_advanced_shared_data_nested select '{"items":[' || arrayStringConcat(arrayMap(i -> '{"big":"' || hex(randomString(1000)) || '","small":"' || toString(i) || '"}', range(4)), ',') || ']}' from numbers(1000000)</fill_query>
+    <!-- Braces are doubled because perf.py expands every query through Python's string formatter. -->
+    <fill_query>insert into json_advanced_shared_data_nested select '{{"items":[' || arrayStringConcat(arrayMap(i -> '{{"big":"' || hex(randomString(1000)) || '","small":"' || toString(i) || '"}}', range(4)), ',') || ']}}' from numbers(1000000)</fill_query>
 
     <query>select json.small from json_advanced_shared_data_top format Null</query>
     <query>select json.items[].small from json_advanced_shared_data_nested format Null</query>
