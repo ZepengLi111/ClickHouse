@@ -20,6 +20,10 @@ target_include_directories (_rapids_logger SYSTEM PUBLIC
     "${RAPIDS_LOGGER_DIR}/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
-target_link_libraries (_rapids_logger PUBLIC ch_contrib::spdlog)
+# Private, the way upstream links it: rapids-logger exists to keep spdlog out of its public
+# API - none of its headers include spdlog - and PRIVATE keeps spdlog's include directories
+# and SPDLOG_* definitions out of every consumer of ch_contrib::rapids_logger. For a static
+# library CMake still carries the link dependency downstream on its own.
+target_link_libraries (_rapids_logger PRIVATE ch_contrib::spdlog)
 
 add_library (ch_contrib::rapids_logger ALIAS _rapids_logger)

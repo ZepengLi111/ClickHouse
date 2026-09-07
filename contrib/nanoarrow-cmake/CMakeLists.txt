@@ -26,7 +26,11 @@ add_library (_nanoarrow
 )
 
 # include/nanoarrow/nanoarrow_config.h is checked in, generated from the upstream
-# nanoarrow_config.h.in.
+# nanoarrow_config.h.in with NANOARROW_NAMESPACE set to `cudf`, which is how cuDF configures
+# nanoarrow too (cpp/cmake/thirdparty/get_nanoarrow.cmake). nanoarrow.h renames every
+# exported C symbol after that macro - `ArrowArrayInitFromType` becomes
+# `cudfArrowArrayInitFromType` - so leaving it unset would export names the cuDF sources are
+# not compiled against.
 target_include_directories (_nanoarrow SYSTEM PUBLIC
     "${ClickHouse_SOURCE_DIR}/contrib/nanoarrow/src"
     "${CMAKE_CURRENT_SOURCE_DIR}/include"

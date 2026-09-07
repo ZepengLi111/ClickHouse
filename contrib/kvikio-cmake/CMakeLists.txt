@@ -58,9 +58,28 @@ target_include_directories (_kvikio SYSTEM PUBLIC
 # dlopen'd at run time, so no cuFile library is linked here and KvikIO falls back to POSIX
 # IO when the driver is missing.
 target_compile_definitions (_kvikio
-    PUBLIC KVIKIO_CUFILE_FOUND KVIKIO_CUFILE_VERSION_API_FOUND
+    PUBLIC KVIKIO_CUFILE_FOUND
     PRIVATE KVIKIO_LOG_ACTIVE_LEVEL=RAPIDS_LOGGER_LOG_LEVEL_INFO
 )
+
+# KVIKIO_CUFILE_VERSION_API_FOUND is a separate feature, not an implication of having
+# cufile.h: upstream sets it only after `cuFileGetVersion` is found (cuFile 1.7, CUDA 12.2).
+# Without it shim/cufile_h_wrapper.hpp declares the symbol itself and src/shim/cufile.cpp
+# reports version 1070, so older cuFile headers keep working - defining it unconditionally
+# would break them. Upstream probes with `try_compile`, which ClickHouse forbids (see
+# cmake/block_build_time_checks.cmake), so the declaration is looked up in the very header
+# that gets compiled - no compiler run, and the answer follows the toolchain in use.
+set (KVIKIO_CUFILE_HEADER "${GPU_CUDA_ROOT}/include/cufile.h")
+file (STRINGS "${KVIKIO_CUFILE_HEADER}" KVIKIO_CUFILE_VERSION_API_DECLARATION
+    REGEX "CUfileError_t[ \t]+cuFileGetVersion[ \t]*\\(")
+if (KVIKIO_CUFILE_VERSION_API_DECLARATION)
+    message (STATUS "Using KvikIO with the cuFile version API")
+    target_compile_definitions (_kvikio PUBLIC KVIKIO_CUFILE_VERSION_API_FOUND)
+else ()
+    message (STATUS "Using KvikIO without the cuFile version API: ${KVIKIO_CUFILE_HEADER} "
+        "does not declare cuFileGetVersion, the cuFile version will be reported as 1070")
+endif ()
+
 target_link_libraries (_kvikio PUBLIC
     ch_contrib::cccl
     ch_contrib::rapids_logger
