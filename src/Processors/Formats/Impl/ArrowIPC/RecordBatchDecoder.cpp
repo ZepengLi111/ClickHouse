@@ -34,7 +34,6 @@
 
 #include <algorithm>
 #include <limits>
-#include <unordered_map>
 
 namespace DB
 {
@@ -52,49 +51,40 @@ namespace DB::ArrowIPC
 
 namespace
 {
-/// Rebuild `type` so its Nullable placement matches the decoded `column`. `fieldToCHType` decides whether a
-/// Struct becomes `Nullable(Tuple)` from the setting alone, while `decodeField` also honours a nullable type
-/// hint, so the two can disagree only in whether a struct is wrapped in Nullable. Walk both in parallel and
-/// adopt the column's nullability, keeping the element names and other details from `type`.
+/// Match the declared type to the decoded column, preserving tuple names. Nullable structs retain their
+/// null maps until conversion, including when schema inference produces a plain `Tuple`.
 DataTypePtr matchColumnNullability(const DataTypePtr & type, const ColumnPtr & column)
 {
-    const bool col_nullable = column->isNullable();
-    const ColumnPtr & nested_col = col_nullable
-        ? assert_cast<const ColumnNullable &>(*column).getNestedColumnPtr() : column;
-    DataTypePtr t = removeNullable(type);
+    const bool is_nullable = column->isNullable();
+    const IColumn & nested_column = is_nullable
+        ? assert_cast<const ColumnNullable &>(*column).getNestedColumn() : *column;
+    DataTypePtr nested_type = removeNullable(type);
 
-    if (const auto * arr_t = typeid_cast<const DataTypeArray *>(t.get()))
+    if (const auto * array_type = typeid_cast<const DataTypeArray *>(nested_type.get()))
     {
-        if (const auto * arr_c = typeid_cast<const ColumnArray *>(nested_col.get()))
-            t = std::make_shared<DataTypeArray>(matchColumnNullability(arr_t->getNestedType(), arr_c->getDataPtr()));
+        const auto & array_column = assert_cast<const ColumnArray &>(nested_column);
+        nested_type = std::make_shared<DataTypeArray>(
+            matchColumnNullability(array_type->getNestedType(), array_column.getDataPtr()));
     }
-    else if (const auto * tup_t = typeid_cast<const DataTypeTuple *>(t.get()))
+    else if (const auto * tuple_type = typeid_cast<const DataTypeTuple *>(nested_type.get()))
     {
-        const auto * tup_c = typeid_cast<const ColumnTuple *>(nested_col.get());
-        if (tup_c && tup_c->tupleSize() == tup_t->getElements().size())
-        {
-            DataTypes elems(tup_t->getElements().size());
-            for (size_t i = 0; i < elems.size(); ++i)
-                elems[i] = matchColumnNullability(tup_t->getElement(i), tup_c->getColumnPtr(i));
-            t = tup_t->hasExplicitNames()
-                ? std::make_shared<DataTypeTuple>(elems, tup_t->getElementNames())
-                : std::make_shared<DataTypeTuple>(elems);
-        }
+        const auto & tuple_column = assert_cast<const ColumnTuple &>(nested_column);
+        DataTypes elements(tuple_type->getElements().size());
+        for (size_t i = 0; i < elements.size(); ++i)
+            elements[i] = matchColumnNullability(tuple_type->getElement(i), tuple_column.getColumnPtr(i));
+        nested_type = tuple_type->hasExplicitNames()
+            ? std::make_shared<DataTypeTuple>(elements, tuple_type->getElementNames())
+            : std::make_shared<DataTypeTuple>(elements);
     }
-    else if (const auto * map_t = typeid_cast<const DataTypeMap *>(t.get()))
+    else if (const auto * map_type = typeid_cast<const DataTypeMap *>(nested_type.get()))
     {
-        const auto * map_c = typeid_cast<const ColumnMap *>(nested_col.get());
-        const auto * arr_c = map_c ? typeid_cast<const ColumnArray *>(map_c->getNestedColumnPtr().get()) : nullptr;
-        const auto * tup_c = arr_c ? typeid_cast<const ColumnTuple *>(arr_c->getDataPtr().get()) : nullptr;
-        if (tup_c && tup_c->tupleSize() == 2)
-            t = std::make_shared<DataTypeMap>(
-                matchColumnNullability(map_t->getKeyType(), tup_c->getColumnPtr(0)),
-                matchColumnNullability(map_t->getValueType(), tup_c->getColumnPtr(1)));
+        const auto & entries = assert_cast<const ColumnMap &>(nested_column).getNestedData();
+        nested_type = std::make_shared<DataTypeMap>(
+            matchColumnNullability(map_type->getKeyType(), entries.getColumnPtr(0)),
+            matchColumnNullability(map_type->getValueType(), entries.getColumnPtr(1)));
     }
 
-    if (col_nullable && t->canBeInsideNullable())
-        return std::make_shared<DataTypeNullable>(t);
-    return t;
+    return is_nullable ? std::make_shared<DataTypeNullable>(nested_type) : nested_type;
 }
 
 /// Expand an Arrow LSB-first bitmap into one byte per row (0 or 1). With `invert` each output byte is
@@ -1705,10 +1695,11 @@ ColumnPtr RecordBatchDecoder::decodeField(
 
 bool RecordBatchDecoder::wrapsInNullable(const ArrowField & field, const IColumn & inner, const DataTypePtr & effective_hint) const
 {
-    const bool nullable_tuple_allowed = settings.schema_inference_allow_nullable_tuple_type
-        || (effective_hint && (effective_hint->isNullable() || effective_hint->isLowCardinalityNullable()));
-    const bool struct_not_allowed_nullable = field.type.kind == TypeKind::Struct && !nullable_tuple_allowed;
-    return field.nullable && inner.canBeInsideNullable() && !struct_not_allowed_nullable;
+    const bool preserve_struct_nulls = settings.schema_inference_allow_nullable_tuple_type
+        || (effective_hint && (effective_hint->isNullable() || effective_hint->isLowCardinalityNullable()
+            || isTuple(stripHint(effective_hint))));
+    return field.nullable && inner.canBeInsideNullable()
+        && (field.type.kind != TypeKind::Struct || preserve_struct_nulls);
 }
 
 void RecordBatchDecoder::skipField(const ArrowField & field)
@@ -1953,7 +1944,7 @@ RecordBatchDecoder::DecodedColumn RecordBatchDecoder::decodeBatchColumn(
             /*invisible_rows=*/nullptr,
             decoded_null_map);
     }
-    /// A requested nullable tuple can add a wrapper beyond the schema's natural type.
+    /// Struct null maps survive decoding even when the inferred type has no nullable wrapper.
     decoded.type = matchColumnNullability(decoded.type, decoded.column);
     if (constant)
         decoded.column = ColumnConst::create(decoded.column, batch_rows);

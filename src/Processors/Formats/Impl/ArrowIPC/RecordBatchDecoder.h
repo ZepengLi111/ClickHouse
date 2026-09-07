@@ -15,8 +15,6 @@
 #include <Common/VectorWithMemoryTracking.h>
 
 #include <optional>
-#include <unordered_map>
-#include <unordered_set>
 
 namespace DB::ArrowIPC
 {
@@ -268,7 +266,7 @@ private:
     /// Builds a bufferless subtree with `rows` materialized values after the caller validates its root
     /// length. Child lengths and buffer slots are still consumed according to the declared layout.
     /// A root can materialize one value for `ColumnConst`; a list child can materialize only the elements
-    /// referenced by visible slots. Requested type hints determine whether structs retain `Nullable`.
+    /// referenced by visible slots. Requested tuple conversions retain struct null maps until conversion.
     ColumnPtr buildSizeDeterminedColumn(
         const ArrowField & field, size_t rows, const DataTypePtr & target_hint, const String & path, size_t list_depth);
 
@@ -317,9 +315,8 @@ private:
         const ArrowField & field, size_t rows, bool allow_low_cardinality, const InvisibleRowsMask * invisible_rows,
         const String & path, size_t list_depth);
     ColumnUInt8::Ptr buildNullMap(const Slice & validity, size_t rows, Int64 null_count) const;
-    /// Returns whether a nullable field retains a `Nullable` wrapper. `Array` and `Map` cannot retain one.
-    /// Struct fields also require `allow_experimental_nullable_tuple_type` or an explicitly nullable
-    /// requested type. `decodeBatchColumn` reconciles the reported type with the resulting column.
+    /// Nullable structs retain their null maps when tuples are nullable or a tuple conversion is
+    /// requested. The reader applies the destination nullability after converting visible rows.
     bool wrapsInNullable(const ArrowField & field, const IColumn & inner, const DataTypePtr & effective_hint) const;
     ColumnPtr readOffsetsAndChild(
         const ArrowField & field, size_t rows, bool large, const DataTypePtr & target_hint, const String & path,
