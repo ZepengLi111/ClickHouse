@@ -105,6 +105,18 @@ namespace
                  /* drop_metric_name = */ false,
              }},
 
+            {"max_over_time",
+             {
+                 "timeSeriesMaxToGrid",
+                 /* drop_metric_name = */ true,
+             }},
+
+            {"min_over_time",
+             {
+                 "timeSeriesMinToGrid",
+                 /* drop_metric_name = */ true,
+             }},
+
             {"deriv",
              {
                  "timeSeriesDerivToGrid",
@@ -143,8 +155,6 @@ namespace
 
             /// TODO:
             /// predict_linear
-            /// min_over_time
-            /// max_over_time
             /// quantile_over_time
             /// stddev_over_time"
             /// stdvar_over_time
