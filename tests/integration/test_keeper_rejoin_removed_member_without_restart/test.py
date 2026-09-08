@@ -104,11 +104,21 @@ def test_rejoin_removed_member_without_restart(started_cluster):
     ku.wait_until_connected(cluster, node3)
     zk3.stop()
     zk3 = create_client(node3)
+    # Serving requests is not the same as having converged on the membership: wait for
+    # node3's own view of the configuration to match the one the reconfiguration returned.
+    ku.wait_configs_equal(config, zk3)
     zk3.sync("/after_removal_49")
 
     # It caught up rather than restarting from the beginning or falling over.
     assert committed_index(node3) > removed_at
     assert zk3.exists("/after_removal_49")
     assert zk3.exists("/before_removal_0")
+
+    # And it is a full member again, not merely readable: a write through it is accepted
+    # and the rest of the group sees it.
+    zk3.create("/after_rejoin", "somedata")
+    zk1.sync("/after_rejoin")
+    assert zk1.exists("/after_rejoin")
+
     assert node3.contains_in_log("Trying to commit a ZXID") is False
     assert node3.contains_in_log("Trying to rollback invalid ZXID") is False
