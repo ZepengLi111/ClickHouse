@@ -1,9 +1,16 @@
 # RAPIDS Memory Manager: the allocator cuDF works through.
 #
-# include/rmm/version_config.hpp is checked in rather than generated, following
-# contrib/sz3-cmake. Regenerate it from rapids-cmake's cmake/template/version.h.in when the
-# submodule moves - and keep the numbers unpadded, since `08` is not a valid C literal and
-# the RMM_VERSION_GT/LT macros do arithmetic on them.
+# The two headers upstream generates into its binary include dir are checked in under
+# include/rmm/ instead, following contrib/sz3-cmake. Both have to be regenerated when the
+# submodule moves:
+#   - version_config.hpp, from rapids-cmake's cmake/template/version.h.in. Keep the numbers
+#     unpadded, since `08` is not a valid C literal and the RMM_VERSION_GT/LT macros do
+#     arithmetic on them.
+#   - logger_macros.hpp, from contrib/rapids-logger/cmake/logger_macros.hpp.in with the
+#     substitutions upstream's create_logger_macros(RMM "rmm::default_logger()" include/rmm)
+#     makes - _RAPIDS_LOGGER_MACRO_PREFIX=RMM and _RAPIDS_LOGGER_DEFAULT_LOGGER=
+#     rmm::default_logger(). rmm/logger.hpp includes it unconditionally, so it is not
+#     optional; contrib/kvikio-cmake keeps its copy the same way.
 
 if (NOT ENABLE_GPU)
     message (STATUS "Not using RMM")

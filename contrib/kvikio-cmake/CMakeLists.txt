@@ -3,8 +3,11 @@
 # Remote IO is left out: it wants libcurl, which ClickHouse does not carry in contrib, and
 # ClickHouse has its own S3 and HTTP stack anyway. That drops the whole KvikIO_REMOTE_SUPPORT
 # block - hdfs.cpp, remote_handle.cpp, shim/libcurl.cpp and detail/{multi_poll_reactor,
-# remote_callback, tls, url}.cpp - so the list below is upstream's base set verbatim. cuFile (GPUDirect Storage) is also absent - KvikIO falls back to
-# POSIX IO, which is what it does on any host without the cuFile driver.
+# remote_callback, tls, url}.cpp - so the list below is upstream's base set verbatim.
+#
+# cuFile (GPUDirect Storage) is compiled in from the toolkit's cufile.h, but the library
+# itself is only dlopen'd at run time, so a host without the cuFile driver still runs the
+# POSIX IO path.
 
 if (NOT ENABLE_GPU)
     message (STATUS "Not using KvikIO")
@@ -53,31 +56,64 @@ target_include_directories (_kvikio SYSTEM PUBLIC
     "${GPU_CUDA_ROOT}/include"
 )
 
-# cufile.h is needed to compile even where GPUDirect Storage is unavailable: shim/cufile.hpp
-# names cuFileBatchIOSetUp outside its own KVIKIO_CUFILE_FOUND guard. The library itself is
-# dlopen'd at run time, so no cuFile library is linked here and KvikIO falls back to POSIX
-# IO when the driver is missing.
 target_compile_definitions (_kvikio
-    PUBLIC KVIKIO_CUFILE_FOUND
     PRIVATE KVIKIO_LOG_ACTIVE_LEVEL=RAPIDS_LOGGER_LOG_LEVEL_INFO
 )
 
-# KVIKIO_CUFILE_VERSION_API_FOUND is a separate feature, not an implication of having
-# cufile.h: upstream sets it only after `cuFileGetVersion` is found (cuFile 1.7, CUDA 12.2).
-# Without it shim/cufile_h_wrapper.hpp declares the symbol itself and src/shim/cufile.cpp
-# reports version 1070, so older cuFile headers keep working - defining it unconditionally
-# would break them. Upstream probes with `try_compile`, which ClickHouse forbids (see
-# cmake/block_build_time_checks.cmake), so the declaration is looked up in the very header
-# that gets compiled - no compiler run, and the answer follows the toolchain in use.
+# The cuFile feature defines, gated the way upstream gates them: KVIKIO_CUFILE_FOUND only
+# where cufile.h is actually there, and KVIKIO_CUFILE_VERSION_API_FOUND only where that
+# header declares `cuFileGetVersion` (cuFile 1.7, CUDA 12.2). The version API is a separate
+# feature, not an implication of having the header: without the define
+# shim/cufile_h_wrapper.hpp declares the symbol itself and src/shim/cufile.cpp reports
+# version 1070, so older cuFile headers keep working - defining it unconditionally would
+# break them.
+#
+# Upstream probes each API with `try_compile`, which ClickHouse forbids (see
+# cmake/block_build_time_checks.cmake), so the declarations are looked up in the very header
+# that gets compiled - no compiler run, and the answer follows the toolchain in use. No
+# cuFile library is linked either way: KvikIO dlopen's it.
 set (KVIKIO_CUFILE_HEADER "${GPU_CUDA_ROOT}/include/cufile.h")
-file (STRINGS "${KVIKIO_CUFILE_HEADER}" KVIKIO_CUFILE_VERSION_API_DECLARATION
-    REGEX "CUfileError_t[ \t]+cuFileGetVersion[ \t]*\\(")
-if (KVIKIO_CUFILE_VERSION_API_DECLARATION)
-    message (STATUS "Using KvikIO with the cuFile version API")
-    target_compile_definitions (_kvikio PUBLIC KVIKIO_CUFILE_VERSION_API_FOUND)
+if (EXISTS "${KVIKIO_CUFILE_HEADER}")
+    file (STRINGS "${KVIKIO_CUFILE_HEADER}" KVIKIO_CUFILE_BATCH_API_DECLARATION
+        REGEX "CUfileError_t[ \t]+cuFileBatchIOSetUp[ \t]*\\(")
+    file (STRINGS "${KVIKIO_CUFILE_HEADER}" KVIKIO_CUFILE_STREAM_API_DECLARATION
+        REGEX "CUfileError_t[ \t]+cuFileReadAsync[ \t]*\\(")
+    file (STRINGS "${KVIKIO_CUFILE_HEADER}" KVIKIO_CUFILE_VERSION_API_DECLARATION
+        REGEX "CUfileError_t[ \t]+cuFileGetVersion[ \t]*\\(")
+
+    # Upstream raises the same two as fatal: the batch and stream entry points are named
+    # unconditionally by shim/cufile.hpp, so a header without them cannot build KvikIO.
+    if (NOT KVIKIO_CUFILE_BATCH_API_DECLARATION)
+        message (FATAL_ERROR "Missing cuFile Batch API: ${KVIKIO_CUFILE_HEADER} does not "
+            "declare cuFileBatchIOSetUp")
+    endif ()
+    if (NOT KVIKIO_CUFILE_STREAM_API_DECLARATION)
+        message (FATAL_ERROR "Missing cuFile Stream API: ${KVIKIO_CUFILE_HEADER} does not "
+            "declare cuFileReadAsync")
+    endif ()
+
+    message (STATUS "Using KvikIO with cuFile (GPUDirect Storage)")
+    target_compile_definitions (_kvikio PUBLIC KVIKIO_CUFILE_FOUND)
+
+    if (KVIKIO_CUFILE_VERSION_API_DECLARATION)
+        message (STATUS "Using KvikIO with the cuFile version API")
+        target_compile_definitions (_kvikio PUBLIC KVIKIO_CUFILE_VERSION_API_FOUND)
+    else ()
+        message (STATUS "Using KvikIO without the cuFile version API: ${KVIKIO_CUFILE_HEADER} "
+            "does not declare cuFileGetVersion, the cuFile version will be reported as 1070")
+    endif ()
 else ()
-    message (STATUS "Using KvikIO without the cuFile version API: ${KVIKIO_CUFILE_HEADER} "
-        "does not declare cuFileGetVersion, the cuFile version will be reported as 1070")
+    # Upstream degrades to POSIX IO here, but only for the part of KvikIO that is guarded:
+    # cufile_h_wrapper.hpp's fallback declares the plain read/write/driver entry points and
+    # nothing else, while shim/cufile.hpp takes `decltype(cuFileBatchIOSetUp)` and
+    # `decltype(cuFileReadAsync)`, and batch.hpp stores a `CUfileBatchHandle_t`, both
+    # outside any guard. So at this pin the header is a build requirement, and saying so at
+    # configure time beats several hundred lines of missing-declaration errors.
+    message (FATAL_ERROR
+        "cufile.h is missing from the CUDA toolkit at ${GPU_CUDA_ROOT} (looked for "
+        "${KVIKIO_CUFILE_HEADER}). It comes with the full CUDA toolkit; on a split install "
+        "it is in the libcufile development package. KvikIO needs it to compile - see "
+        "contrib/kvikio-cmake/CMakeLists.txt.")
 endif ()
 
 target_link_libraries (_kvikio PUBLIC

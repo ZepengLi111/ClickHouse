@@ -46,6 +46,14 @@ target_link_libraries (_rtcx PUBLIC
     ch_gpu::cudart
 )
 
+# src/rtcx.cpp includes <nvtx3/nvtx3.hpp> and instantiates ::nvtx3::scoped_range_in
+# unconditionally, the way upstream links nvtx3::nvtx3-cpp. Header-only and PRIVATE - no
+# public header of rtcx names NVTX - and linked plainly rather than through $<LINK_ONLY:>,
+# since the include path is the whole point of the dependency. ch_contrib::nvtx3 carries
+# nothing but that path, so it does not hand this island target global-group's compile
+# options the way ch_contrib::zstd above would.
+target_link_libraries (_rtcx PRIVATE ch_contrib::nvtx3)
+
 # Without these two, rtcx.cpp defaults both to 0 and reaches nvrtc and nvJitLink through
 # dlopen("libnvrtc.so.<major>") and dlsym, leaving the archives above unreferenced and the
 # shared libraries a run-time requirement. Upstream sets the same pair from
