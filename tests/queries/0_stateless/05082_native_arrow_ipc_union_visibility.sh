@@ -22,6 +22,8 @@ import pyarrow.ipc as ipc
 
 out = sys.argv[1]
 local = shlex.split(os.environ["CLICKHOUSE_LOCAL"])
+queries = []
+checks = []
 type_ids = pa.array([0, 1, 0, 1], type=pa.int8())
 
 # Dense unions address compact children by offset, while sparse children retain the parent's row count.
@@ -44,12 +46,21 @@ for mode in ("dense", "sparse"):
             path = f"{out}/{mode}_{nullable}.{fmt}"
             with writer_type(path, batch.schema) as writer:
                 writer.write_batch(batch)
-            result = subprocess.run(local + [
-                "--path", f"{out}/local", "--max_threads=1", "--allow_experimental_nullable_tuple_type=0",
-                "--query", f"SELECT toJSONString(c) FROM file('{path}', '{fmt}', 'c Tuple(v Variant(Int32, String))') FORMAT TSVRaw",
-            ], text=True, capture_output=True)
-            assert result.returncode == 0, result.stderr
-            actual = [json.loads(line) for line in result.stdout.splitlines()]
-            assert actual == expected, (fmt, mode, nullable, actual, expected)
-            print(f"OK {fmt} {mode} {'nullable' if nullable else 'non-nullable'}")
+            queries.append(
+                f"SELECT toJSONString(c) FROM file('{path}', '{fmt}', 'c Tuple(v Variant(Int32, String))') FORMAT TSVRaw;")
+            checks.append((f"OK {fmt} {mode} {'nullable' if nullable else 'non-nullable'}", expected))
+
+result = subprocess.run(local + [
+    "--path", f"{out}/local", "--max_threads=1", "--allow_experimental_nullable_tuple_type=0",
+    "--multiquery", "--query", "\n".join(queries),
+], text=True, capture_output=True)
+assert result.returncode == 0 and not result.stderr, (result.returncode, result.stderr)
+lines = result.stdout.splitlines()
+position = 0
+for name, expected in checks:
+    actual = [json.loads(line) for line in lines[position:position + len(expected)]]
+    assert actual == expected, (name, actual, expected)
+    position += len(expected)
+    print(name)
+assert position == len(lines), lines[position:]
 PY

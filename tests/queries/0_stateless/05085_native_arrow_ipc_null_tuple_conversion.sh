@@ -24,6 +24,8 @@ import pyarrow.ipc as ipc
 
 out = Path(sys.argv[1])
 local = shlex.split(os.environ["CLICKHOUSE_LOCAL"])
+queries = []
+checks = []
 
 
 def make_struct(values, nulls, name="a", child_nullable=False):
@@ -107,52 +109,52 @@ for fmt, writer, reader in (("Arrow", ipc.new_file, ipc.open_file),
         with writer(path, batch.schema) as stream:
             stream.write_batch(batch)
         assert reader(path).read_all().to_pydict() == batch.to_pydict()
-        result = subprocess.run(
-            local + ["--path", str(out / "local"), "--max_threads=1",
-                     f"--allow_experimental_nullable_tuple_type={nullable_tuples}",
-                     f"--input_format_null_as_default={null_as_default}",
-                     "--output_format_json_named_tuples_as_objects=1", f"--param_structure=s {target}", "--query",
-                     f"SELECT s FROM file('{path}', '{fmt}', {{structure:String}}) FORMAT JSONEachRow"],
-            text=True, capture_output=True)
-        assert result.returncode == 0, (fmt, name, result.stderr)
-        actual = [json.loads(line)["s"] for line in result.stdout.splitlines()]
-        assert actual == expected, (fmt, name, actual, expected)
-        print(f"{fmt} {name}: OK")
+        structure = ("s " + target).replace("'", "''")
+        queries.append(
+            f"SELECT s FROM file('{path}', '{fmt}', '{structure}') FORMAT JSONEachRow "
+            f"SETTINGS allow_experimental_nullable_tuple_type={nullable_tuples}, "
+            f"input_format_null_as_default={null_as_default};")
+        checks.append((f"{fmt} {name}: OK", expected))
 
     # Column defaults apply to null input tuples when null-as-default handling is enabled.
     for nullable_tuples in (0, 1):
-        result = subprocess.run(
-            local + ["--path", str(out / "local"), "--max_threads=1",
-                     f"--allow_experimental_nullable_tuple_type={nullable_tuples}",
-                     "--input_format_null_as_default=1", "--input_format_defaults_for_omitted_fields=1",
-                     "--multiquery", "--query",
-                     "CREATE TEMPORARY TABLE default_rows (s Tuple(a Int32) DEFAULT tuple(99)); "
-                     f"INSERT INTO default_rows FROM INFILE '{out / f'plain.{fmt}'}' FORMAT {fmt}; "
-                     "SELECT s FROM default_rows FORMAT JSONEachRow"],
-            text=True, capture_output=True)
-        assert result.returncode == 0, (fmt, "column_default", result.stderr)
-        actual = [json.loads(line)["s"] for line in result.stdout.splitlines()]
-        assert actual == [{"a": 99}, {"a": 456}, {"a": 789}], (fmt, actual)
-        print(f"{fmt} column_default_{nullable_tuples}: OK")
+        queries.extend([
+            f"SET allow_experimental_nullable_tuple_type={nullable_tuples}, input_format_null_as_default=1, "
+            "input_format_defaults_for_omitted_fields=1;",
+            "CREATE TEMPORARY TABLE default_rows (s Tuple(a Int32) DEFAULT tuple(99));",
+            f"INSERT INTO default_rows FROM INFILE '{out / f'plain.{fmt}'}' FORMAT {fmt};",
+            "SELECT s FROM default_rows FORMAT JSONEachRow;",
+            "DROP TABLE default_rows;",
+        ])
+        checks.append((f"{fmt} column_default_{nullable_tuples}: OK", [{"a": 99}, {"a": 456}, {"a": 789}]))
+    queries.append("SET input_format_null_as_default=0, input_format_defaults_for_omitted_fields=0;")
 
-    result = subprocess.run(
-        local + ["--path", str(out / "local"), "--max_threads=1",
-                 "--allow_experimental_nullable_tuple_type=1", "--input_format_null_as_default=0", "--query",
-                 f"SELECT s FROM file('{out / f'plain.{fmt}'}', '{fmt}', 's Tuple(a Int32)')"],
-        text=True, capture_output=True)
-    assert result.returncode != 0 and "CANNOT_INSERT_NULL_IN_ORDINARY_COLUMN" in result.stderr, result.stderr
-    print(f"{fmt} null_tuple: rejected")
+    queries.append(
+        f"SELECT s FROM file('{out / f'plain.{fmt}'}', '{fmt}', 's Tuple(a Int32)') "
+        "SETTINGS allow_experimental_nullable_tuple_type=1; -- { serverError CANNOT_INSERT_NULL_IN_ORDINARY_COLUMN }")
+    checks.append((f"{fmt} null_tuple: rejected", []))
 
     invalid = make_struct(pa.array(["123", "invalid"]), [True, False])
     path = out / f"visible_text.{fmt}"
     batch = pa.record_batch([invalid], names=["s"])
     with writer(path, batch.schema) as stream:
         stream.write_batch(batch)
-    result = subprocess.run(
-        local + ["--path", str(out / "local"), "--max_threads=1",
-                 "--allow_experimental_nullable_tuple_type=1", "--query",
-                 f"SELECT s FROM file('{path}', '{fmt}', 's Nullable(Tuple(a Int32))')"],
-        text=True, capture_output=True)
-    assert result.returncode != 0 and "CANNOT_PARSE_TEXT" in result.stderr, result.stderr
-    print(f"{fmt} visible_text: rejected")
+    queries.append(
+        f"SELECT s FROM file('{path}', '{fmt}', 's Nullable(Tuple(a Int32))') "
+        "SETTINGS allow_experimental_nullable_tuple_type=1; -- { serverError CANNOT_PARSE_TEXT }")
+    checks.append((f"{fmt} visible_text: rejected", []))
+
+result = subprocess.run(local + [
+    "--path", str(out / "local"), "--max_threads=1", "--output_format_json_named_tuples_as_objects=1",
+    "--multiquery", "--query", "\n".join(queries),
+], text=True, capture_output=True)
+assert result.returncode == 0 and not result.stderr, (result.returncode, result.stderr)
+lines = result.stdout.splitlines()
+position = 0
+for name, expected in checks:
+    actual = [json.loads(line)["s"] for line in lines[position:position + len(expected)]]
+    assert actual == expected, (name, actual, expected)
+    position += len(expected)
+    print(name)
+assert position == len(lines), lines[position:]
 PY

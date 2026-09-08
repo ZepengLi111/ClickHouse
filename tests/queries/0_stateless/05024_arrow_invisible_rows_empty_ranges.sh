@@ -5,6 +5,7 @@
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
+set -e
 
 TMP_DIR="${CLICKHOUSE_TMP}/${CLICKHOUSE_TEST_UNIQUE_NAME}"
 mkdir -p "$TMP_DIR"
@@ -91,15 +92,20 @@ struct_t32 = pa.Array.from_buffers(
 write("struct_time32_under_null", struct_t32, "s")
 PYEOF
 
-for f in list_string_under_null large_list_string_under_null fixed_size_list_string_under_null list_dict_string_under_null; do
-    echo "=== $f as Array(Int32)"
-    $CLICKHOUSE_LOCAL -q "SELECT * FROM file('$TMP_DIR/$f.arrow', 'Arrow', 'a Array(Int32)')"
-done
-echo "=== map_string_under_null as Map(String, Int32)"
-$CLICKHOUSE_LOCAL -q "SELECT * FROM file('$TMP_DIR/map_string_under_null.arrow', 'Arrow', 'm Map(String, Int32)')"
-echo "=== map_key_string_under_null as Map(Int32, String)"
-$CLICKHOUSE_LOCAL -q "SELECT * FROM file('$TMP_DIR/map_key_string_under_null.arrow', 'Arrow', 'm Map(Int32, String)')"
-echo "=== struct_list_string_under_null as Tuple(a Array(Int32))"
-$CLICKHOUSE_LOCAL -q "SELECT * FROM file('$TMP_DIR/struct_list_string_under_null.arrow', 'Arrow', 's Tuple(a Array(Int32))')"
-echo "=== struct_time32_under_null as Tuple(t Time64(0))"
-$CLICKHOUSE_LOCAL -q "SELECT * FROM file('$TMP_DIR/struct_time32_under_null.arrow', 'Arrow', 's Tuple(t Time64(0))')"
+{
+    for f in list_string_under_null large_list_string_under_null fixed_size_list_string_under_null list_dict_string_under_null; do
+        echo "SELECT '=== $f as Array(Int32)';"
+        echo "SELECT * FROM file('$TMP_DIR/$f.arrow', 'Arrow', 'a Array(Int32)');"
+    done
+    echo "SELECT '=== map_string_under_null as Map(String, Int32)';"
+    echo "SELECT * FROM file('$TMP_DIR/map_string_under_null.arrow', 'Arrow', 'm Map(String, Int32)');"
+    echo "SELECT '=== map_key_string_under_null as Map(Int32, String)';"
+    echo "SELECT * FROM file('$TMP_DIR/map_key_string_under_null.arrow', 'Arrow', 'm Map(Int32, String)');"
+    echo "SELECT '=== struct_list_string_under_null as Tuple(a Array(Int32))';"
+    echo "SELECT * FROM file('$TMP_DIR/struct_list_string_under_null.arrow', 'Arrow', 's Tuple(a Array(Int32))');"
+    echo "SELECT '=== struct_time32_under_null as Tuple(t Time64(0))';"
+    echo "SELECT * FROM file('$TMP_DIR/struct_time32_under_null.arrow', 'Arrow', 's Tuple(t Time64(0))');"
+} > "$TMP_DIR/queries.sql"
+
+${CLICKHOUSE_LOCAL} --path "$TMP_DIR/local" --max_threads=1 \
+    --multiquery --queries-file "$TMP_DIR/queries.sql"

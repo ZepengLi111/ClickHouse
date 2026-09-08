@@ -5,6 +5,7 @@
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
+set -e
 
 TMP_DIR="${CLICKHOUSE_TMP}/${CLICKHOUSE_TEST_UNIQUE_NAME}"
 mkdir -p "$TMP_DIR"
@@ -62,57 +63,6 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 #   struct_union_garbage_type_id_under_null:         the type-id byte itself is garbage (99) under NULL
 #   struct_dense_union_garbage_offset_under_null:    the dense offset itself is garbage (999) under NULL
 
-SELF_DESCRIBING_FILES="struct_date32_garbage_under_null \
-    struct_dict_garbage_index_under_null \
-    struct_dict_default_garbage_index_under_null \
-    struct_struct_date32_garbage_under_null \
-    struct_list_date32_garbage_under_null \
-    struct_large_list_date32_garbage_under_null \
-    struct_fixed_size_list_date32_garbage_under_null \
-    struct_map_date32_garbage_under_null \
-    struct_string_view_garbage_view_under_null \
-    list_date32_garbage_in_null_slot_range \
-    fixed_size_list_date32_garbage_in_null_slot_range \
-    map_date32_garbage_in_null_slot_range \
-    sparse_union_date32_garbage_in_unselected \
-    sparse_union_dict_garbage_index_in_unselected \
-    struct_sparse_union_date32_garbage_under_null \
-    struct_dense_union_date32_garbage_under_null \
-    struct_union_garbage_type_id_under_null \
-    struct_dense_union_garbage_offset_under_null"
-
-for f in $SELF_DESCRIBING_FILES; do
-    echo "=== $f"
-    $CLICKHOUSE_LOCAL -q "SELECT * FROM file('$CUR_DIR/data_arrow/$f.arrow', 'Arrow')
-        SETTINGS allow_experimental_nullable_tuple_type = 1"
-done
-
-# The raw-byte targets need an explicit structure: `binary` carries no type of its own.
-echo "=== struct_json_garbage_bytes_under_null"
-$CLICKHOUSE_LOCAL -q "SELECT * FROM file('$CUR_DIR/data_arrow/struct_json_garbage_bytes_under_null.arrow', 'Arrow', 's Nullable(Tuple(j JSON))')
-    SETTINGS allow_experimental_nullable_tuple_type = 1, enable_json_type = 1"
-echo "=== struct_ipv6_binary_garbage_under_null"
-$CLICKHOUSE_LOCAL -q "SELECT * FROM file('$CUR_DIR/data_arrow/struct_ipv6_binary_garbage_under_null.arrow', 'Arrow', 's Nullable(Tuple(v IPv6))')
-    SETTINGS allow_experimental_nullable_tuple_type = 1"
-echo "=== struct_int128_binary_garbage_under_null"
-$CLICKHOUSE_LOCAL -q "SELECT * FROM file('$CUR_DIR/data_arrow/struct_int128_binary_garbage_under_null.arrow', 'Arrow', 's Nullable(Tuple(n Int128))')
-    SETTINGS allow_experimental_nullable_tuple_type = 1"
-echo "=== struct_array_ipv6_binary_garbage_under_null"
-$CLICKHOUSE_LOCAL -q "SELECT * FROM file('$CUR_DIR/data_arrow/struct_array_ipv6_binary_garbage_under_null.arrow', 'Arrow', 's Nullable(Tuple(a Array(IPv6)))')
-    SETTINGS allow_experimental_nullable_tuple_type = 1"
-
-# Without the nullable-tuple setting the struct is read as a plain Tuple: its null map is dropped and
-# the NULL row becomes a visible one, which must show type defaults, not the hidden bytes. The numeric
-# type hint additionally selects the raw date32 read that skips the range check.
-echo "=== struct_date32_garbage_under_null as Tuple(d Int32)"
-$CLICKHOUSE_LOCAL -q "SELECT * FROM file('$CUR_DIR/data_arrow/struct_date32_garbage_under_null.arrow', 'Arrow', 's Tuple(d Int32)')"
-echo "=== struct_date32_garbage_under_null as Tuple(d Date32)"
-$CLICKHOUSE_LOCAL -q "SELECT * FROM file('$CUR_DIR/data_arrow/struct_date32_garbage_under_null.arrow', 'Arrow', 's Tuple(d Date32)')"
-echo "=== struct_ipv6_binary_garbage_under_null as Tuple(v IPv6)"
-$CLICKHOUSE_LOCAL -q "SELECT * FROM file('$CUR_DIR/data_arrow/struct_ipv6_binary_garbage_under_null.arrow', 'Arrow', 's Tuple(v IPv6)')"
-echo "=== struct_int128_binary_garbage_under_null as Tuple(n Int128)"
-$CLICKHOUSE_LOCAL -q "SELECT * FROM file('$CUR_DIR/data_arrow/struct_int128_binary_garbage_under_null.arrow', 'Arrow', 's Tuple(n Int128)')"
-
 # The `fixed_size_binary` leaves the ClickHouse writer uses for UUID, IPv6 and the 128/256-bit
 # integers. Their raw bytes are reinterpreted verbatim, so the hidden bytes of a NULL struct row would
 # surface as a value of the target type; and the self-describing Arrow `uuid` extension type decodes
@@ -149,19 +99,81 @@ struct_with_garbage_under_null("struct_fixed_binary32_garbage_under_null", 32, p
 struct_with_garbage_under_null("struct_uuid_garbage_under_null", 16, pa.uuid())
 PYEOF
 
-for type_name in UUID IPv6 Int128 UInt128; do
-    echo "=== struct_fixed_binary_garbage_under_null as Tuple(b $type_name)"
-    $CLICKHOUSE_LOCAL -q "SELECT * FROM file('$TMP_DIR/struct_fixed_binary_garbage_under_null.arrow', 'Arrow', 's Tuple(b $type_name)')"
-done
-for type_name in Int256 UInt256; do
-    echo "=== struct_fixed_binary32_garbage_under_null as Tuple(b $type_name)"
-    $CLICKHOUSE_LOCAL -q "SELECT * FROM file('$TMP_DIR/struct_fixed_binary32_garbage_under_null.arrow', 'Arrow', 's Tuple(b $type_name)')"
-done
+SELF_DESCRIBING_FILES="struct_date32_garbage_under_null \
+    struct_dict_garbage_index_under_null \
+    struct_dict_default_garbage_index_under_null \
+    struct_struct_date32_garbage_under_null \
+    struct_list_date32_garbage_under_null \
+    struct_large_list_date32_garbage_under_null \
+    struct_fixed_size_list_date32_garbage_under_null \
+    struct_map_date32_garbage_under_null \
+    struct_string_view_garbage_view_under_null \
+    list_date32_garbage_in_null_slot_range \
+    fixed_size_list_date32_garbage_in_null_slot_range \
+    map_date32_garbage_in_null_slot_range \
+    sparse_union_date32_garbage_in_unselected \
+    sparse_union_dict_garbage_index_in_unselected \
+    struct_sparse_union_date32_garbage_under_null \
+    struct_dense_union_date32_garbage_under_null \
+    struct_union_garbage_type_id_under_null \
+    struct_dense_union_garbage_offset_under_null"
 
-echo "=== struct_uuid_garbage_under_null"
-$CLICKHOUSE_LOCAL -q "SELECT * FROM file('$TMP_DIR/struct_uuid_garbage_under_null.arrow', 'Arrow')
-    SETTINGS allow_experimental_nullable_tuple_type = 1"
-# The same file as a plain Tuple: the struct null map is dropped, so row 0 becomes visible and the
-# self-describing UUID leaf must show the default instead of the hidden bytes.
-echo "=== struct_uuid_garbage_under_null as a plain Tuple"
-$CLICKHOUSE_LOCAL -q "SELECT * FROM file('$TMP_DIR/struct_uuid_garbage_under_null.arrow', 'Arrow')"
+write_query()
+{
+    printf '%s;\n' "$1"
+}
+
+{
+    for f in $SELF_DESCRIBING_FILES; do
+        echo "SELECT '=== $f';"
+        write_query "SELECT * FROM file('$CUR_DIR/data_arrow/$f.arrow', 'Arrow')
+            SETTINGS allow_experimental_nullable_tuple_type = 1"
+    done
+
+    # The raw-byte targets need an explicit structure: `binary` carries no type of its own.
+    echo "SELECT '=== struct_json_garbage_bytes_under_null';"
+    write_query "SELECT * FROM file('$CUR_DIR/data_arrow/struct_json_garbage_bytes_under_null.arrow', 'Arrow', 's Nullable(Tuple(j JSON))')
+        SETTINGS allow_experimental_nullable_tuple_type = 1, enable_json_type = 1"
+    echo "SELECT '=== struct_ipv6_binary_garbage_under_null';"
+    write_query "SELECT * FROM file('$CUR_DIR/data_arrow/struct_ipv6_binary_garbage_under_null.arrow', 'Arrow', 's Nullable(Tuple(v IPv6))')
+        SETTINGS allow_experimental_nullable_tuple_type = 1"
+    echo "SELECT '=== struct_int128_binary_garbage_under_null';"
+    write_query "SELECT * FROM file('$CUR_DIR/data_arrow/struct_int128_binary_garbage_under_null.arrow', 'Arrow', 's Nullable(Tuple(n Int128))')
+        SETTINGS allow_experimental_nullable_tuple_type = 1"
+    echo "SELECT '=== struct_array_ipv6_binary_garbage_under_null';"
+    write_query "SELECT * FROM file('$CUR_DIR/data_arrow/struct_array_ipv6_binary_garbage_under_null.arrow', 'Arrow', 's Nullable(Tuple(a Array(IPv6)))')
+        SETTINGS allow_experimental_nullable_tuple_type = 1"
+
+    # Without the nullable-tuple setting the struct is read as a plain Tuple: its null map is dropped and
+    # the NULL row becomes a visible one, which must show type defaults, not the hidden bytes. The numeric
+    # type hint additionally selects the raw date32 read that skips the range check.
+    echo "SELECT '=== struct_date32_garbage_under_null as Tuple(d Int32)';"
+    write_query "SELECT * FROM file('$CUR_DIR/data_arrow/struct_date32_garbage_under_null.arrow', 'Arrow', 's Tuple(d Int32)')"
+    echo "SELECT '=== struct_date32_garbage_under_null as Tuple(d Date32)';"
+    write_query "SELECT * FROM file('$CUR_DIR/data_arrow/struct_date32_garbage_under_null.arrow', 'Arrow', 's Tuple(d Date32)')"
+    echo "SELECT '=== struct_ipv6_binary_garbage_under_null as Tuple(v IPv6)';"
+    write_query "SELECT * FROM file('$CUR_DIR/data_arrow/struct_ipv6_binary_garbage_under_null.arrow', 'Arrow', 's Tuple(v IPv6)')"
+    echo "SELECT '=== struct_int128_binary_garbage_under_null as Tuple(n Int128)';"
+    write_query "SELECT * FROM file('$CUR_DIR/data_arrow/struct_int128_binary_garbage_under_null.arrow', 'Arrow', 's Tuple(n Int128)')"
+
+
+    for type_name in UUID IPv6 Int128 UInt128; do
+        echo "SELECT '=== struct_fixed_binary_garbage_under_null as Tuple(b $type_name)';"
+        write_query "SELECT * FROM file('$TMP_DIR/struct_fixed_binary_garbage_under_null.arrow', 'Arrow', 's Tuple(b $type_name)')"
+    done
+    for type_name in Int256 UInt256; do
+        echo "SELECT '=== struct_fixed_binary32_garbage_under_null as Tuple(b $type_name)';"
+        write_query "SELECT * FROM file('$TMP_DIR/struct_fixed_binary32_garbage_under_null.arrow', 'Arrow', 's Tuple(b $type_name)')"
+    done
+
+    echo "SELECT '=== struct_uuid_garbage_under_null';"
+    write_query "SELECT * FROM file('$TMP_DIR/struct_uuid_garbage_under_null.arrow', 'Arrow')
+        SETTINGS allow_experimental_nullable_tuple_type = 1"
+    # The same file as a plain Tuple: the struct null map is dropped, so row 0 becomes visible and the
+    # self-describing UUID leaf must show the default instead of the hidden bytes.
+    echo "SELECT '=== struct_uuid_garbage_under_null as a plain Tuple';"
+    write_query "SELECT * FROM file('$TMP_DIR/struct_uuid_garbage_under_null.arrow', 'Arrow')"
+} > "$TMP_DIR/queries.sql"
+
+${CLICKHOUSE_LOCAL} --path "$TMP_DIR/local" --max_threads=1 \
+    --multiquery --queries-file "$TMP_DIR/queries.sql"
