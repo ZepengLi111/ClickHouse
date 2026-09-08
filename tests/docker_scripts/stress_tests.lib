@@ -181,8 +181,22 @@ EOL
     max_users_mem=$((total_mem*30/100)) # 30%
     # Similar to docker/test/fuzzer/query-fuzzer-tweaks-users.xml
     echo "Setting max_memory_usage_for_user=$max_users_mem and max_memory_usage for queries to 10G"
-    # The heredoc delimiter is unquoted so that ${max_users_mem} expands. That also means backticks
-    # and $(...) would be evaluated, so keep them out of the XML comments below.
+    # The heredoc delimiter is unquoted so that ${max_users_mem} expands, which also means the shell
+    # evaluates backticks and $(...) in the body. The body's comments are XML comments too, where a
+    # double hyphen is not allowed. Rationale needing any of those goes in a shell comment, like this
+    # one for the `allow_experimental_window_view` constraint below:
+    #
+    # `WINDOW VIEW` is removed, and the setting is an obsolete no-op here, but the upgrade
+    # check runs the *previous release's* test suite under the *previous release's* binary,
+    # which still accepts `CREATE WINDOW VIEW`. `clickhouse-test --upgrade-check` runs the
+    # client with `--fake-drop`, so those tests' `DROP TABLE` is ignored and the window view
+    # is left in the metadata, which the new binary then cannot load on the post-upgrade
+    # restart. Keep the setting unchangeable until the previous release no longer contains
+    # tests that create window views. The constraint alone is enough: it rejects any change
+    # with `SETTING_CONSTRAINT_VIOLATION`, and both binaries default the setting to `false`.
+    # Assigning the value in the profile instead would mark an obsolete setting as changed on
+    # the new binary, which adds an `Obsolete setting` entry to `system.warnings` that
+    # `01945_system_warnings` asserts is absent.
     cat > /etc/clickhouse-server/users.d/stress_test_tweaks-users.xml <<EOL
 <clickhouse>
     <profiles>
@@ -227,19 +241,6 @@ EOL
                     <readonly/>
                 </max_ast_depth>
 
-                <!--
-                 `WINDOW VIEW` is removed, and the setting is an obsolete no-op here, but the upgrade
-                 check runs the *previous release's* test suite under the *previous release's* binary,
-                 which still accepts `CREATE WINDOW VIEW`. `clickhouse-test --upgrade-check` runs the
-                 client with `--fake-drop`, so those tests' `DROP TABLE` is ignored and the window view
-                 is left in the metadata, which the new binary then cannot load on the post-upgrade
-                 restart. Keep the setting unchangeable until the previous release no longer contains
-                 tests that create window views. The constraint alone is enough: it rejects any change
-                 with `SETTING_CONSTRAINT_VIOLATION`, and both binaries default the setting to `false`.
-                 Assigning the value in the profile instead would mark an obsolete setting as changed on
-                 the new binary, which adds an `Obsolete setting` entry to `system.warnings` that
-                 `01945_system_warnings` asserts is absent.
-                -->
                 <allow_experimental_window_view>
                     <readonly/>
                 </allow_experimental_window_view>
