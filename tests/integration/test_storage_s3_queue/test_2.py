@@ -483,6 +483,20 @@ select splitByChar('/', file_name)[-1] as file from system.s3queue_metadata_cach
         zk = started_cluster.get_kazoo_client("zoo1")
         buckets = zk.get_children(f"{keeper_path}/buckets/")
         assert len(buckets) == shards_num
+
+        # The commit that writes a bucket's `processed` pointer also drops the file's `processing`
+        # node, and it runs after the inserted rows are already visible, so an empty `processing`
+        # folder rather than a row count is what proves the pointers of finished files are written.
+        processing_left = (
+            "SELECT processing_nodes_count FROM system.s3_queue_metadata "
+            f"WHERE zookeeper_path ilike '%{keeper_path}%'"
+        )
+        for _ in range(60):
+            if run_query(node, processing_left).strip() == "0":
+                break
+            time.sleep(1)
+        assert run_query(node, processing_left).strip() == "0"
+
         # A bucket node is created together with the table metadata, but its `processed` child
         # appears only once a file from that bucket has been committed.
         for bucket in buckets:
