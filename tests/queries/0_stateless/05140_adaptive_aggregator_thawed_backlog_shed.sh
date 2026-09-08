@@ -70,10 +70,21 @@ SELECT 'thawed onto the baseline path', sumIf(value, event = 'AdaptiveAggregatio
 SELECT 'swept under pressure', sumIf(value, event = 'AdaptiveAggregationPressureSweeps') > 0 FROM system.events;
 "
 
+# The three streams below each reach the hook on a shape of their own, and each of them ends by
+# reading its counter into the pooled assertion at the end of the file rather than asserting on it
+# here. Which producer arrives at the baseline spill trigger first is a race, so a single stream
+# reads the counter as a coin flip even when the backlog does end up shed, and three separate
+# reads redden three times as often as one. Pooling costs nothing that is measured elsewhere: the
+# part bound stays on the first stream, and each of these three keeps the claim only it can make -
+# no two-level table on the single-level stream, no thaw at all on the mixed one. It is not a way
+# for something else to satisfy the read either, because none of these shapes reaches a non-zero
+# counter without the hook: with the hook reverted all three read 0.
+shed_total=0
+
 # The part bound above needs the shedding to be rare, because every crossing of the threshold writes
 # one part, and a shape that crosses often puts the two arms' part counts on top of each other. The
 # hook's own observable needs the opposite: where the crossing happens only in the first blocks after
-# the thaw, one missed crossing leaves the counter at zero for the whole run. So it is asserted over
+# the thaw, one missed crossing leaves the counter at zero for the whole run. So it is read over
 # a second stream, at a quarter of the threshold, where the crossing recurs on most blocks and a
 # thawed producer therefore reaches the hook on the block it thaws on. The counter still lands at one
 # shed per producer, because the backlog is shed once and a later crossing finds it gone: measured
@@ -82,9 +93,10 @@ SELECT 'swept under pressure', sumIf(value, event = 'AdaptiveAggregationPressure
 # first one.
 #
 # Its own process again: `system.events` is cumulative for the whole process, so run together with
-# the stream above this assertion would stay green whenever the hook fires only there, and it would
-# pin nothing about this shape.
-$CLICKHOUSE_LOCAL --query "
+# the stream above this read would return non-zero whenever the hook fires only there, and it would
+# pin nothing about this shape. That is also why the pooling is over the three per-stream reads and
+# not over one process running all three.
+out=$($CLICKHOUSE_LOCAL --query "
 SET max_threads = 2;
 SET max_block_size = 8192;
 SET enable_adaptive_aggregator = 1;
@@ -109,10 +121,11 @@ SELECT 'liveness stream', count() FROM
 -- proves a shed happened rather than that the trigger was reached. The liveness assertions above are
 -- satisfiable by the pre-existing finish-time drain as well, and the part bound is the oracle; this
 -- one pins the hook itself.
-SELECT 'shed the backlog on the baseline pressure path',
-       sumIf(value, event = 'AdaptiveAggregationSpillBacklogSheds') > 0
-FROM system.events;
-"
+SELECT sumIf(value, event = 'AdaptiveAggregationSpillBacklogSheds') FROM system.events;
+")
+# The counter is the last line of the stream's output, and it is the only line held back from it.
+printf '%s\n' "${out%$'\n'*}"
+shed_total=$(( shed_total + ${out##*$'\n'} ))
 
 # The freeze thresholds sit far below the two-level ones, so a thawed producer can carry the whole
 # backlog while its own table is still single-level and unspillable. Waiting for the conversion
@@ -121,10 +134,10 @@ FROM system.events;
 # entirely: the hook is the only thing that can shed after the thaw, and with it gated behind the
 # conversion nothing does - measured with this binary, the hook sheds 3-4 times per run, and with it
 # reverted the same query holds ~99 MiB and dies under a 100 MB limit in 2 runs out of 5. The limit
-# is left generous here because the assertion is the counter, not the peak.
+# is left generous here because what this stream contributes is the counter, not the peak.
 #
-# A separate process again, so that the counter cannot be satisfied by the streams above.
-$CLICKHOUSE_LOCAL --query "
+# A separate process again, so that its read cannot be satisfied by the streams above.
+out=$($CLICKHOUSE_LOCAL --query "
 SET max_threads = 2;
 SET max_block_size = 8192;
 SET enable_adaptive_aggregator = 1;
@@ -145,10 +158,10 @@ SELECT 'single-level stream', count() FROM
 );
 
 SELECT 'thawed onto the baseline path', sumIf(value, event = 'AdaptiveAggregationThaws') > 0 FROM system.events;
-SELECT 'shed the backlog without a two-level table',
-       sumIf(value, event = 'AdaptiveAggregationSpillBacklogSheds') > 0
-FROM system.events;
-"
+SELECT sumIf(value, event = 'AdaptiveAggregationSpillBacklogSheds') FROM system.events;
+")
+printf '%s\n' "${out%$'\n'*}"
+shed_total=$(( shed_total + ${out##*$'\n'} ))
 
 # The hook is gated on the baseline phase and not on the thaw that motivated it, because the backlog
 # is session-wide memory and whichever producer arrives at the spill trigger is the right one to shed
@@ -170,8 +183,8 @@ FROM system.events;
 #
 # Measured with this binary the hook sheds once and takes the whole backlog with it.
 #
-# A separate process again, so that the counters cannot be satisfied by the streams above.
-$CLICKHOUSE_LOCAL --query "
+# A separate process again, so that its counters cannot be satisfied by the streams above.
+out=$($CLICKHOUSE_LOCAL --query "
 SET max_threads = 2;
 SET max_block_size = 8192;
 SET enable_adaptive_aggregator = 1;
@@ -198,7 +211,12 @@ SELECT 'mixed stream', count() FROM
 
 SELECT 'no thread thawed', sumIf(value, event = 'AdaptiveAggregationThaws') = 0 FROM system.events;
 SELECT 'a producer gave up on freezing', sumIf(value, event = 'AdaptiveAggregationGiveUps') > 0 FROM system.events;
-SELECT 'shed the backlog with no thaw',
-       sumIf(value, event = 'AdaptiveAggregationSpillBacklogSheds') > 0
-FROM system.events;
-"
+SELECT sumIf(value, event = 'AdaptiveAggregationSpillBacklogSheds') FROM system.events;
+")
+printf '%s\n' "${out%$'\n'*}"
+shed_total=$(( shed_total + ${out##*$'\n'} ))
+
+# Naming the streams the read was pooled over, so that a red run does not have to work out from the
+# source that the line is a disjunction and which shapes it covers.
+printf 'shed the backlog on the baseline pressure path in at least one of the liveness, single-level and mixed streams\t%d\n' \
+    "$(( shed_total > 0 ))"
