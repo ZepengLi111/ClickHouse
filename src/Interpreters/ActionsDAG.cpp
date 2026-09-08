@@ -578,16 +578,31 @@ const ActionsDAG::Node & ActionsDAG::addBooleanCondition(const Node & node, cons
 {
     const Node * res = &node;
 
-    /// Go through `Bool` instead of casting straight to `result_type`: `CAST(256, 'UInt8')` is 0 and
-    /// turns a true condition false, while `CAST(256, 'Bool')` is 1. `Bool` already holds 0 or 1, and
+    /// Only `Bool` is known to hold normalized values; a plain `UInt8` column can hold e.g. 2.
     /// `Nothing` has no values to normalize.
     auto nested_type = removeLowCardinalityAndNullable(node.result_type);
     if (!isBool(nested_type) && !isNothing(nested_type))
     {
-        DataTypePtr bool_type = DataTypeFactory::instance().get("Bool");
-        if (isNullableOrLowCardinalityNullable(node.result_type))
-            bool_type = makeNullable(bool_type);
-        res = &addCast(*res, bool_type, {}, context);
+        if (node.column)
+        {
+            /// A constant is normalized by a cast, which folds it here and adds no node to the plan.
+            /// `and` cannot do it: it reads a constant through `FieldVisitorConvertToNumber`, which
+            /// throws on a value like -0.5. Through `Bool`, because `CAST(256, 'UInt8')` is 0.
+            DataTypePtr bool_type = DataTypeFactory::instance().get("Bool");
+            if (isNullableOrLowCardinalityNullable(node.result_type))
+                bool_type = makeNullable(bool_type);
+            res = &addCast(*res, bool_type, {}, context);
+        }
+        else
+        {
+            /// `and(x, true)` for an expression: the optimizer reads a condition through the functions
+            /// it knows, and a `_CAST` around one hides it from selectivity estimation.
+            auto uint8_type = std::make_shared<DataTypeUInt8>();
+            const auto & true_node = addColumn(uint8_type->createColumnConst(0, 1), uint8_type, "true");
+            FunctionOverloadResolverPtr func_builder_and
+                = std::make_unique<FunctionToOverloadResolverAdaptor>(std::make_shared<FunctionAnd>());
+            res = &addFunction(func_builder_and, {res, &true_node}, {});
+        }
     }
 
     /// A NULL condition is not true, and casting a NULL to a non-Nullable type would throw.
@@ -601,9 +616,11 @@ const ActionsDAG::Node & ActionsDAG::addBooleanCondition(const Node & node, cons
         res = &addFunction(FunctionFactory::instance().get("ifNull", context), {res, &false_node}, {});
     }
 
-    /// Compare the names, not just `equals`: `Bool` is a `UInt8` and compares equal to it, but a
-    /// caller that asked for `UInt8` wants a column that prints as 1, not as `true`.
-    if (res->result_type->getName() != result_type->getName())
+    /// An already normalized condition is returned untouched: an extra `_CAST` around it hides the
+    /// predicate from selectivity estimation. Once a node has been added, match `result_type` by name
+    /// as well, because `Bool` compares equal to `UInt8` but prints `true` rather than 1.
+    const bool converted = res != &node;
+    if (converted ? res->result_type->getName() != result_type->getName() : !res->result_type->equals(*result_type))
         res = &addCast(*res, result_type, {}, context);
 
     return *res;
