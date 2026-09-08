@@ -5,7 +5,7 @@
 namespace DB
 {
 
-/// The null-safe comparison falls back to the plain one for tuples; instantiated in equals.cpp.
+/// Avoid second instantiation
 extern template class FunctionComparison<EqualsOp, NameEquals>;
 
 REGISTER_FUNCTION(IsNotDistinctFrom)

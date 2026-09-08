@@ -8,6 +8,8 @@ namespace DB
 
 using FunctionLess = FunctionComparison<LessOp, NameLess>;
 using FunctionEquals = FunctionComparison<EqualsOp, NameEquals>;
+
+/// Avoid second instantiation
 extern template class FunctionComparison<EqualsOp, NameEquals>;
 
 REGISTER_FUNCTION(Less)

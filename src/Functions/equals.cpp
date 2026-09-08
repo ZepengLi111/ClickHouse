@@ -8,12 +8,9 @@ namespace DB
 {
 
 using FunctionEquals = FunctionComparison<EqualsOp, NameEquals>;
-/// Used through `FunctionIsNotDistinctFrom` in `executeArrayLexicographic`; instantiated in isNotDistinctFrom.cpp.
-extern template class FunctionComparison<EqualsOp, NameEquals, true>;
 
 REGISTER_FUNCTION(Equals)
 {
-    // Documentation for equals
     FunctionDocumentation::Description description = "Compares two values for equality.";
     FunctionDocumentation::Syntax syntax = R"(
         equals(a, b)
