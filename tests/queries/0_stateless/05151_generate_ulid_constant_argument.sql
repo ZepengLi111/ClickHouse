@@ -8,3 +8,7 @@ SELECT uniqExact(generateULID('x')) FROM numbers(100);
 SELECT uniqExact(generateULID()) FROM numbers(100);
 SELECT generateULID('x') != generateULID('y');
 SELECT length(generateULID('x')) FROM numbers(2);
+
+-- The argument is ignored, so an ignored `NULL` still produces an identifier.
+SELECT length(generateULID(NULL));
+SELECT uniqExact(generateULID(NULL)) FROM numbers(100);
