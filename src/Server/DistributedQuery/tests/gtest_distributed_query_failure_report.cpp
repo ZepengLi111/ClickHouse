@@ -281,7 +281,7 @@ TEST(StreamingExchangeSourceFailureReport, NoMoreDataNeededToGonePeerIsNotAFailu
     ASSERT_NO_THROW(source->work());
     peer.join();
     /// Wait until the reset arrived, so the send fails instead of being buffered.
-    pollfd descriptor{.fd = source->schedule(), .events = POLLIN | POLLRDHUP, .revents = 0};
+    pollfd descriptor{.fd = source->schedule(), .events = POLLIN, .revents = 0};
     ASSERT_EQ(poll(&descriptor, 1, 5000), 1) << "the peer's reset did not arrive";
 
     InputPort downstream(source->getPort().getHeader());
