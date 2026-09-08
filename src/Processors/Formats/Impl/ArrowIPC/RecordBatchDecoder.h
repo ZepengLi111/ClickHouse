@@ -262,8 +262,8 @@ private:
     bool bufferlessSubtreeDeclaresNulls(const ArrowField & field, size_t & node_offset) const;
     /// Builds a bufferless subtree with `rows` materialized values after the caller validates its root
     /// length. Child lengths and buffer slots are still consumed according to the declared layout.
-    /// A root can materialize one value for `ColumnConst`; a list child can materialize only the elements
-    /// referenced by visible slots. Requested tuple conversions retain struct null maps until conversion.
+    /// A root can materialize one value for `ColumnConst`; list and union children materialize only
+    /// selected values. Requested tuple conversions retain struct null maps until conversion.
     ColumnPtr buildSizeDeterminedColumn(
         const ArrowField & field, size_t rows, const DataTypePtr & target_hint, const String & path, size_t list_depth);
 

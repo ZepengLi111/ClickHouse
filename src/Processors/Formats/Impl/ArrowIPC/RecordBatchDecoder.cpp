@@ -1237,7 +1237,7 @@ ColumnPtr RecordBatchDecoder::buildSizeDeterminedColumn(
         const size_t list_size = static_cast<size_t>(type.list_size);
         expectNextNodeLength(declared_child, "fixed-size-list child");
         ColumnPtr child = buildSizeDeterminedColumn(
-            type.children.at(0), rows * list_size, arrayElementHint(effective_hint), path, list_depth + 1);
+            type.children.at(0), fixedSizeListChildRows(type, rows), arrayElementHint(effective_hint), path, list_depth + 1);
         auto offsets_col = ColumnUInt64::create(rows);
         auto & offs = offsets_col->getData();
         for (size_t i = 0; i < rows; ++i)
@@ -1382,15 +1382,17 @@ ColumnPtr RecordBatchDecoder::decodeUnion(const ArrowField & field, size_t rows,
     /// FieldNode but no buffers and contribute no Variant element. The rest become Variant elements.
     Columns variant_columns;
     DataTypes variant_types;
-    /// `ColumnVariant` elements cannot be Nullable, so the element-level null map is dropped from the
-    /// stored column. Keep a pointer to it (per local element, nullptr if the child is not nullable) so
-    /// rows that reference a null child value can be translated to the Variant NULL discriminator below,
-    /// instead of silently becoming the nested column's default value.
-    VectorWithMemoryTracking<const NullMap *> child_null_maps;
-    /// Each `child_null_maps` entry points into the null-map column of a `ColumnNullable`. The owning
-    /// `ColumnNullable` is dropped below (only its nested column is kept as the Variant element), so keep
-    /// the null-map columns alive here for the lifetime of the decode; otherwise the pointers dangle.
-    VectorWithMemoryTracking<ColumnPtr> child_null_map_holders;
+    /// Per Variant element: the child's own null map (null when it declares no nulls), kept apart from the
+    /// element column because `ColumnVariant` elements cannot be Nullable and Array/Map/Tuple columns carry
+    /// no null map of their own, so a selected null value can still become a `Variant` NULL below. A
+    /// size-determined dense child holds only the selected values, in row order, and `next_row` walks them.
+    struct ChildState
+    {
+        ColumnUInt8::Ptr null_map;
+        bool size_determined;
+        size_t next_row = 0;
+    };
+    VectorWithMemoryTracking<ChildState> child_states;
     /// Maps an Arrow union type id to a local Variant element index, or -1 for the NULL placeholder.
     UnorderedMapWithMemoryTracking<int, int> type_id_to_local;
     size_t total_child_rows = 0;
@@ -1407,58 +1409,52 @@ ColumnPtr RecordBatchDecoder::decodeUnion(const ArrowField & field, size_t rows,
             continue;
         }
 
-        /// Dense children can declare more rows than the union references. Their visibility masks
-        /// cover every declared row, including bufferless children, so the message-body row bound applies.
-        if (dense)
-            checkRowCountWithinBody(peekNodeRows(), fmt::format("dense union child '{}'", child.name));
-
-        /// Visibility of this child's rows: a child slot holds a meaningful value only when its row's
-        /// type id selects this child — non-selected slots hold undefined bytes per the Arrow spec, even
-        /// in a file with no nulls anywhere — and only when the row is not invisible at an ancestor
-        /// level.
-        const std::optional<InvisibleRowsMask> child_invisible = [&]() -> std::optional<InvisibleRowsMask>
+        /// A dense child may declare more rows than the union selects. A buffer-less child has no buffer
+        /// whose size could bound that count, so it is built from the selected rows alone, in row order.
+        /// Any other child's declared length is backed by a buffer the subtree validation of
+        /// `decodeBatchColumn` has already checked, so it keeps its declared layout under a visibility
+        /// mask: a slot holds a meaningful value only when a visible row's type id selects it — other
+        /// slots hold undefined bytes per the Arrow spec, even in a file without nulls — so value decoding
+        /// must skip them.
+        const size_t child_rows = peekNodeRows();
+        const bool size_determined = dense && isSizeDeterminedSubtree(child);
+        InvisibleRowsMask child_invisible;
+        if (!size_determined)
+            child_invisible.resize_fill(child_rows, 1);
+        size_t selected_rows = 0;
+        for (size_t row = 0; row < rows; ++row)
         {
-            const size_t child_rows = peekNodeRows();
-            InvisibleRowsMask mask;
-            mask.resize_fill(child_rows, 1);
-            for (size_t row = 0; row < rows; ++row)
-            {
-                if (type_ids[row] != tid || isInvisible(invisible_rows, row))
-                    continue;
+            if (type_ids[row] != tid || isInvisible(invisible_rows, row))
+                continue;
 
-                const Int64 target = dense ? Int64(value_offsets[row]) : Int64(row);
-                if (target >= 0 && static_cast<size_t>(target) < child_rows)
-                    mask[static_cast<size_t>(target)] = 0;
-            }
-            return mask;
-        }();
+            const Int64 target = dense ? Int64(value_offsets[row]) : Int64(row);
+            if (dense && (target < 0 || static_cast<size_t>(target) >= child_rows))
+                throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow dense union offset {} out of range", target);
+            ++selected_rows;
+            if (!size_determined)
+                child_invisible[static_cast<size_t>(target)] = 0;
+        }
 
-        ColumnPtr child_column = decodeField(
-            child,
-            /*allow_low_cardinality=*/false,
-            /*target_hint=*/nullptr,
-            /*path=*/{},
-            /*list_depth=*/0,
-            maskPtr(child_invisible));
-        DataTypePtr child_type = fieldToCHType(child, settings, /*make_nullable=*/false);
-        /// Variant elements cannot be Nullable; remember the null map, then drop the nullability.
-        const NullMap * child_null_map = nullptr;
+        ColumnUInt8::Ptr child_null_map;
+        ColumnPtr child_column = size_determined
+            ? buildSizeDeterminedColumn(child, selected_rows, /*target_hint=*/nullptr, /*path=*/{}, /*list_depth=*/0)
+            : decodeField(
+                child, /*allow_low_cardinality=*/false, /*target_hint=*/nullptr, /*path=*/{}, /*list_depth=*/0,
+                &child_invisible, &child_null_map);
+        DataTypePtr child_type = fieldToCHType(child, settings, /*make_nullable=*/false, /*allow_null_type=*/true);
+        /// The decoded null map survives even when a complex child cannot retain its outer wrapper.
+        /// A nullable dictionary result also includes nulls contributed by dictionary entries.
         if (child_column->isNullable())
         {
             const auto & nullable = assert_cast<const ColumnNullable &>(*child_column);
-            /// Keep the null-map column alive: the line below reassigns `child_column` to the nested
-            /// column, which would otherwise free the only owner of this `ColumnNullable` (and its null
-            /// map), leaving `child_null_map` dangling for the row checks further down.
-            ColumnPtr null_map_holder = nullable.getNullMapColumnPtr();
-            child_null_map = &assert_cast<const ColumnUInt8 &>(*null_map_holder).getData();
-            child_null_map_holders.push_back(std::move(null_map_holder));
+            child_null_map = nullable.getNullMapColumn().getPtr();
             child_column = nullable.getNestedColumnPtr();
         }
         type_id_to_local[tid] = static_cast<int>(variant_columns.size());
         total_child_rows += child_column->size();
         variant_columns.push_back(std::move(child_column));
         variant_types.push_back(removeNullable(child_type));
-        child_null_maps.push_back(child_null_map);
+        child_states.push_back({std::move(child_null_map), size_determined});
     }
 
     /// The Variant's global discriminator order is defined by sorting element type names; build the
@@ -1521,18 +1517,14 @@ ColumnPtr RecordBatchDecoder::decodeUnion(const ArrowField & field, size_t rows,
             emit_null_row(row);
             continue;
         }
-        /// The child row this row's value lives in: the row itself for the sparse layout, the
-        /// offsets-referenced row for the dense one.
-        size_t src = row;
-        if (dense)
-        {
-            const Int32 off = value_offsets[row];
-            if (off < 0 || static_cast<size_t>(off) >= variant_columns[local]->size())
-                throw Exception(ErrorCodes::INCORRECT_DATA, "Arrow dense union offset {} out of range", off);
-            src = static_cast<size_t>(off);
-        }
-        /// A referenced null value in a nullable child becomes a Variant NULL, not a default value.
-        if (child_null_maps[local] && (*child_null_maps[local])[src])
+        /// The child row this row's value lives in: the next selected value of a size-determined child,
+        /// the offsets-referenced row of another dense child, the row itself in the sparse layout.
+        ChildState & child_state = child_states[local];
+        const size_t src = child_state.size_determined
+            ? child_state.next_row++
+            : (dense ? static_cast<size_t>(value_offsets[row]) : row);
+        /// A referenced null value in a nullable child becomes a `Variant` NULL.
+        if (child_state.null_map && child_state.null_map->getData()[src])
         {
             emit_null_row(row);
             continue;
