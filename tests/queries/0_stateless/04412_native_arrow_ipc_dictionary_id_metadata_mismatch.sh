@@ -56,12 +56,11 @@ for name, left, right in (
 PY
 
 for CASE in uuid_extension uuid_logical_type struct_names union_names; do
-    if ${CLICKHOUSE_LOCAL} --calculate_text_stack_trace=0 --query "
-        SELECT * FROM file('${TMP_DIR}/${CASE}.arrows', 'ArrowStream') FORMAT Null" \
-        > "${TMP_DIR}/${CASE}.out" 2> "${TMP_DIR}/${CASE}.err"; then
-        echo "Expected incompatible dictionary values to be rejected: ${CASE}"
-        exit 1
-    fi
-    grep -qF 'different value types' "${TMP_DIR}/${CASE}.err"
-    echo "Rejected ${CASE}"
-done
+    cat <<SQL
+SELECT * FROM file('${TMP_DIR}/${CASE}.arrows', 'ArrowStream') FORMAT Null; -- { serverError INCORRECT_DATA }
+SELECT 'Rejected ${CASE}';
+SQL
+done > "$TMP_DIR/queries.sql"
+
+${CLICKHOUSE_LOCAL} --path "$TMP_DIR/local" --max_threads=1 \
+    --multiquery --queries-file "$TMP_DIR/queries.sql"

@@ -5,6 +5,7 @@
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
+set -e
 
 # The ClickHouse Arrow writer stores UUID, IPv6 and the 128/256-bit integers as fixed_size_binary, and with
 # `output_format_arrow_low_cardinality_as_dictionary` a `LowCardinality` column of such a type becomes an
@@ -19,11 +20,19 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # LowCardinality); then pyarrow-written `dictionary<binary>` values — variable binary, converted while the
 # dictionary batch decodes — at the top level, inside a list, and extended by a delta dictionary in a stream.
 
-PREFIX="${CLICKHOUSE_TMP}/${CLICKHOUSE_TEST_UNIQUE_NAME}"
+TMP_DIR="${CLICKHOUSE_TMP}/${CLICKHOUSE_TEST_UNIQUE_NAME}"
+mkdir -p "$TMP_DIR"
+trap 'rm -rf "$TMP_DIR"' EXIT
+PREFIX="$TMP_DIR/data"
+
+write_query()
+{
+    printf '%s;\n' "$1"
+}
 
 for FORMAT in Arrow ArrowStream; do
     FILE="${PREFIX}_lc.${FORMAT}"
-    ${CLICKHOUSE_LOCAL} --allow_suspicious_low_cardinality_types=1 --query "
+    write_query "
         INSERT INTO FUNCTION file('${FILE}', '${FORMAT}')
         SELECT
             toLowCardinality(toInt128(number) - 5) AS i128,
@@ -39,20 +48,19 @@ for FORMAT in Arrow ArrowStream; do
         FROM numbers(3)
         SETTINGS output_format_arrow_low_cardinality_as_dictionary = 1, engine_file_truncate_on_insert = 1"
 
-    echo "--- ${FORMAT}: inferred schema, the natural uninterpreted types ---"
-    ${CLICKHOUSE_LOCAL} --query "DESCRIBE file('${FILE}', '${FORMAT}')" | cut -f1,2
-    echo "--- ${FORMAT}: read with the plain types ---"
-    ${CLICKHOUSE_LOCAL} --query "
+    echo "SELECT '--- ${FORMAT}: inferred schema, the natural uninterpreted types ---';"
+    write_query "DESCRIBE file('${FILE}', '${FORMAT}') SETTINGS describe_compact_output=1"
+    echo "SELECT '--- ${FORMAT}: read with the plain types ---';"
+    write_query "
         SELECT * FROM file('${FILE}', '${FORMAT}',
             'i128 Int128, u128 UInt128, i256 Int256, u256 UInt256, uuid UUID, ip6 IPv6, ni128 Nullable(Int128),
              arr Array(Int128), tup Tuple(v UInt256), m Map(String, IPv6)')"
-    echo "--- ${FORMAT}: read with the LowCardinality types it was written as ---"
-    ${CLICKHOUSE_LOCAL} --allow_suspicious_low_cardinality_types=1 --query "
+    echo "SELECT '--- ${FORMAT}: read with the LowCardinality types it was written as ---';"
+    write_query "
         SELECT * FROM file('${FILE}', '${FORMAT}',
             'i128 LowCardinality(Int128), u128 LowCardinality(UInt128), i256 LowCardinality(Int256), u256 LowCardinality(UInt256),
              uuid LowCardinality(UUID), ip6 LowCardinality(IPv6), ni128 LowCardinality(Nullable(Int128)),
              arr Array(LowCardinality(Int128)), tup Tuple(v LowCardinality(UInt256)), m Map(String, LowCardinality(IPv6))')"
-    rm -f "${FILE}"
 
     python3 - "${PREFIX}" "${FORMAT}" <<'PY'
 import sys
@@ -85,12 +93,14 @@ if fmt == "ArrowStream":
         w.write_batch(b1)
         w.write_batch(b2)
 PY
-    echo "--- ${FORMAT}: pyarrow dictionary<binary> read as Int128 / Array(Int128) ---"
-    ${CLICKHOUSE_LOCAL} --query "SELECT * FROM file('${PREFIX}_bin.${FORMAT}', '${FORMAT}', 'd Int128, l Array(Int128)')"
-    rm -f "${PREFIX}_bin.${FORMAT}"
+    echo "SELECT '--- ${FORMAT}: pyarrow dictionary<binary> read as Int128 / Array(Int128) ---';"
+    write_query "SELECT * FROM file('${PREFIX}_bin.${FORMAT}', '${FORMAT}', 'd Int128, l Array(Int128)')"
+
     if [ "${FORMAT}" = "ArrowStream" ]; then
-        echo "--- ${FORMAT}: delta dictionary read as Int128 ---"
-        ${CLICKHOUSE_LOCAL} --query "SELECT * FROM file('${PREFIX}_delta.${FORMAT}', '${FORMAT}', 'd Int128') ORDER BY d"
-        rm -f "${PREFIX}_delta.${FORMAT}"
+        echo "SELECT '--- ${FORMAT}: delta dictionary read as Int128 ---';"
+        write_query "SELECT * FROM file('${PREFIX}_delta.${FORMAT}', '${FORMAT}', 'd Int128') ORDER BY d"
     fi
-done
+done > "$TMP_DIR/queries.sql"
+
+${CLICKHOUSE_LOCAL} --path "$TMP_DIR/local" --max_threads=1 --allow_suspicious_low_cardinality_types=1 \
+    --multiquery --queries-file "$TMP_DIR/queries.sql"

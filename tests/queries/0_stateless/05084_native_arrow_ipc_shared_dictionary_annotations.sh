@@ -26,6 +26,8 @@ import pyarrow.ipc as ipc
 
 out = Path(sys.argv[1])
 local = shlex.split(os.environ["CLICKHOUSE_LOCAL"])
+queries = []
+checks = []
 
 
 def indirect(data, position):
@@ -138,12 +140,20 @@ for name, left, right, left_metadata, right_metadata in cases:
         assert reader_type(pa.py_buffer(data)).read_all().to_pydict() == batch.to_pydict()
         path = out / f"{name}.{fmt}"
         path.write_bytes(data)
-        result = subprocess.run(local + [
-            "--path", str(out / "local"), "--max_threads=1", "--schema_inference_make_columns_nullable=0",
-            "--query", f"SELECT toJSONString(a), toJSONString(b) FROM file('{path}', '{fmt}') FORMAT TSVRaw",
-        ], text=True, capture_output=True)
-        assert result.returncode == 0, result.stderr
-        actual = [[json.loads(value) for value in row.split("\t")] for row in result.stdout.splitlines()]
-        assert actual == expected, (name, fmt, actual, expected)
-        print(f"OK {name} {fmt}")
+        queries.append(f"SELECT toJSONString(a), toJSONString(b) FROM file('{path}', '{fmt}') FORMAT TSVRaw;")
+        checks.append((f"OK {name} {fmt}", expected))
+
+result = subprocess.run(local + [
+    "--path", f"{out}/local", "--max_threads=1", "--schema_inference_make_columns_nullable=0",
+    "--multiquery", "--query", "\n".join(queries),
+], text=True, capture_output=True)
+assert result.returncode == 0 and not result.stderr, (result.returncode, result.stderr)
+lines = result.stdout.splitlines()
+position = 0
+for name, expected in checks:
+    actual = [[json.loads(value) for value in line.split("\t")] for line in lines[position:position + len(expected)]]
+    assert actual == expected, (name, actual, expected)
+    position += len(expected)
+    print(name)
+assert position == len(lines), lines[position:]
 PY

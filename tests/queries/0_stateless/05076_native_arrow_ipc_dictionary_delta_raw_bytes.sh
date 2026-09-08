@@ -5,6 +5,7 @@
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
+set -e
 
 TMP_DIR="${CLICKHOUSE_TMP}/${CLICKHOUSE_TEST_UNIQUE_NAME}"
 mkdir -p "$TMP_DIR"
@@ -54,20 +55,23 @@ write("width_changes", pa.array(base, type=pa.binary()), pa.array(base + [b"abc"
 write("width_kept", pa.array(base, type=pa.binary()), pa.array(base + [raw(67890)], type=pa.binary()))
 PYEOF
 
-# The two record batches may be decoded in parallel, so the rows are sorted for a stable output.
-read_as()
+write_query()
 {
-    ${CLICKHOUSE_LOCAL} --allow_suspicious_low_cardinality_types=1 \
-        --query "SELECT $2 FROM file('${TMP_DIR}/$1.arrows', 'ArrowStream', '$3') ORDER BY b" 2>&1
+    echo "SELECT $2 FROM file('${TMP_DIR}/$1.arrows', 'ArrowStream', '$3') ORDER BY b; ${4:-}"
 }
 
-echo "--- width changes, b String ---"
-read_as width_changes "hex(b)" "b String"
-echo "--- width changes, b LowCardinality(String) ---"
-read_as width_changes "hex(b)" "b LowCardinality(String)"
-echo "--- width changes, b Int128: rejected ---"
-read_as width_changes "b" "b Int128" | grep -o "TYPE_MISMATCH" | head -n 1
-echo "--- width kept, b Int128 ---"
-read_as width_kept "b" "b Int128"
-echo "--- width kept, b LowCardinality(Int128) ---"
-read_as width_kept "b" "b LowCardinality(Int128)"
+{
+    echo "SELECT '--- width changes, b String ---';"
+    write_query width_changes "hex(b)" "b String"
+    echo "SELECT '--- width changes, b LowCardinality(String) ---';"
+    write_query width_changes "hex(b)" "b LowCardinality(String)"
+    echo "SELECT '--- width changes, b Int128: rejected ---';"
+    write_query width_changes "b" "b Int128" "-- { serverError TYPE_MISMATCH }"
+    echo "SELECT '--- width kept, b Int128 ---';"
+    write_query width_kept "b" "b Int128"
+    echo "SELECT '--- width kept, b LowCardinality(Int128) ---';"
+    write_query width_kept "b" "b LowCardinality(Int128)"
+} > "$TMP_DIR/queries.sql"
+
+${CLICKHOUSE_LOCAL} --path "$TMP_DIR/local" --max_threads=1 --allow_suspicious_low_cardinality_types=1 \
+    --multiquery --queries-file "$TMP_DIR/queries.sql"

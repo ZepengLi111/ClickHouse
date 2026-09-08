@@ -5,6 +5,7 @@
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
+set -e
 
 TMP_DIR="${CLICKHOUSE_TMP}/${CLICKHOUSE_TEST_UNIQUE_NAME}"
 mkdir -p "$TMP_DIR"
@@ -111,19 +112,36 @@ for name in table.column_names:
 PYEOF
 
 FILE="${TMP_DIR}/shared.arrows"
-read_as() { ${CLICKHOUSE_LOCAL} --allow_suspicious_low_cardinality_types=1 --query "SELECT $1 FROM file('${FILE}', 'ArrowStream', '$2')" 2>&1; }
+write_query()
+{
+    echo "SELECT $1 FROM file('${FILE}', 'ArrowStream', '$2'); ${3:-}"
+}
 
-echo "--- a Int128, b UInt128 ---";                    read_as "a, b" "a Int128, b UInt128"
-echo "--- a Int128, b LowCardinality(Int128) ---";     read_as "a, b" "a Int128, b LowCardinality(Int128)"
-echo "--- b UInt128 alone ---";                        read_as "b" "b UInt128"
-echo "--- a, b as String: the natural decoding ---";   read_as "hex(a), hex(b)" "a String, b String"
-echo "--- d1 Int32, d2 Int64 ---";                     read_as "d1, d2" "d1 Int32, d2 Int64"
-echo "--- d1 Int32, d2 LowCardinality(Int32) ---";     read_as "d1, d2" "d1 Int32, d2 LowCardinality(Int32)"
-echo "--- d1 Int32, d2 Date32: the Date32 request still rejects the out-of-range day ---"
-read_as "d1, d2" "d1 Int32, d2 Date32" | grep -o "VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE" | head -n 1
-echo "--- t1 DateTime, t2 DateTime('UTC') ---";                read_as "toDate(t1), toDate(t2)" "t1 DateTime, t2 DateTime(''UTC'')"
-echo "--- t1 DateTime64(3), t2 DateTime64(3, 'UTC') ---";      read_as "toDate(t1), toDate(t2)" "t1 DateTime64(3), t2 DateTime64(3, ''UTC'')"
-echo "--- n1 LowCardinality(String), n2 LowCardinality(Nullable(String)) ---"
-read_as "n1, n2" "n1 LowCardinality(String), n2 LowCardinality(Nullable(String))"
-echo "--- n1, n2 with their inferred types ---"
-${CLICKHOUSE_LOCAL} --query "SELECT n1, n2, toTypeName(n1), toTypeName(n2) FROM file('${FILE}', 'ArrowStream')" 2>&1
+{
+    echo "SELECT '--- a Int128, b UInt128 ---';"
+    write_query "a, b" "a Int128, b UInt128"
+    echo "SELECT '--- a Int128, b LowCardinality(Int128) ---';"
+    write_query "a, b" "a Int128, b LowCardinality(Int128)"
+    echo "SELECT '--- b UInt128 alone ---';"
+    write_query "b" "b UInt128"
+    echo "SELECT '--- a, b as String: the natural decoding ---';"
+    write_query "hex(a), hex(b)" "a String, b String"
+    echo "SELECT '--- d1 Int32, d2 Int64 ---';"
+    write_query "d1, d2" "d1 Int32, d2 Int64"
+    echo "SELECT '--- d1 Int32, d2 LowCardinality(Int32) ---';"
+    write_query "d1, d2" "d1 Int32, d2 LowCardinality(Int32)"
+    echo "SELECT '--- d1 Int32, d2 Date32: the Date32 request still rejects the out-of-range day ---';"
+    write_query "d1, d2" "d1 Int32, d2 Date32" "-- { serverError VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE }"
+    echo "SELECT '--- t1 DateTime, t2 DateTime(''UTC'') ---' FORMAT TSVRaw;"
+    write_query "toDate(t1), toDate(t2)" "t1 DateTime, t2 DateTime(''UTC'')"
+    echo "SELECT '--- t1 DateTime64(3), t2 DateTime64(3, ''UTC'') ---' FORMAT TSVRaw;"
+    write_query "toDate(t1), toDate(t2)" \
+        "t1 DateTime64(3), t2 DateTime64(3, ''UTC'')"
+    echo "SELECT '--- n1 LowCardinality(String), n2 LowCardinality(Nullable(String)) ---';"
+    write_query "n1, n2" "n1 LowCardinality(String), n2 LowCardinality(Nullable(String))"
+    echo "SELECT '--- n1, n2 with their inferred types ---';"
+    echo "SELECT n1, n2, toTypeName(n1), toTypeName(n2) FROM file('${FILE}', 'ArrowStream');"
+} > "$TMP_DIR/queries.sql"
+
+${CLICKHOUSE_LOCAL} --path "$TMP_DIR/local" --max_threads=1 --allow_suspicious_low_cardinality_types=1 \
+    --multiquery --queries-file "$TMP_DIR/queries.sql"

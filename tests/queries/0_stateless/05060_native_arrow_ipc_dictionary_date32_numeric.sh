@@ -5,6 +5,7 @@
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
+set -e
 
 # A `date32` read into a numeric target returns the raw day number without the `Date32` range check; a
 # dictionary-encoded `date32` — what `output_format_arrow_low_cardinality_as_dictionary` writes for a
@@ -18,11 +19,19 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # `Nested` subcolumn target resolved through the dotted column name — with the dictionary inside the struct
 # and with the whole `Nested` column dictionary-encoded — and that a `Date32` target still rejects the value.
 
-PREFIX="${CLICKHOUSE_TMP}/${CLICKHOUSE_TEST_UNIQUE_NAME}"
+TMP_DIR="${CLICKHOUSE_TMP}/${CLICKHOUSE_TEST_UNIQUE_NAME}"
+mkdir -p "$TMP_DIR"
+trap 'rm -rf "$TMP_DIR"' EXIT
+PREFIX="$TMP_DIR/data"
+
+write_query()
+{
+    printf '%s;\n' "$1"
+}
 
 for FORMAT in Arrow ArrowStream; do
     FILE="${PREFIX}_lc.${FORMAT}"
-    ${CLICKHOUSE_LOCAL} --allow_suspicious_low_cardinality_types=1 --query "
+    write_query "
         INSERT INTO FUNCTION file('${FILE}', '${FORMAT}')
         SELECT
             toLowCardinality(d) AS d,
@@ -32,16 +41,15 @@ for FORMAT in Arrow ArrowStream; do
         FROM (SELECT toDate32('9999-12-31') + 100 AS d)
         SETTINGS output_format_arrow_low_cardinality_as_dictionary = 1, engine_file_truncate_on_insert = 1"
 
-    echo "--- ${FORMAT}: numeric targets return the raw day number ---"
-    ${CLICKHOUSE_LOCAL} --query "
+    echo "SELECT '--- ${FORMAT}: numeric targets return the raw day number ---';"
+    write_query "
         SELECT * FROM file('${FILE}', '${FORMAT}', 'd Int32, arr Array(Int32), tup Tuple(x Int32), m Map(String, Int32)')"
-    ${CLICKHOUSE_LOCAL} --allow_suspicious_low_cardinality_types=1 --query "
+    write_query "
         SELECT * FROM file('${FILE}', '${FORMAT}', 'd LowCardinality(Int32), arr Array(LowCardinality(Int32))')"
-    echo "--- ${FORMAT}: Decimal target ---"
-    ${CLICKHOUSE_LOCAL} --query "SELECT d FROM file('${FILE}', '${FORMAT}', 'd Decimal(10, 0)')"
-    echo "--- ${FORMAT}: Date32 target still rejects the out-of-range day ---"
-    ${CLICKHOUSE_LOCAL} --query "SELECT d FROM file('${FILE}', '${FORMAT}', 'd Date32')" 2>&1 | grep -o "VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE" | head -1
-    rm -f "${FILE}"
+    echo "SELECT '--- ${FORMAT}: Decimal target ---';"
+    write_query "SELECT d FROM file('${FILE}', '${FORMAT}', 'd Decimal(10, 0)')"
+    echo "SELECT '--- ${FORMAT}: Date32 target still rejects the out-of-range day ---';"
+    write_query "SELECT d FROM file('${FILE}', '${FORMAT}', 'd Date32'); -- { serverError VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE }"
 
     python3 - "${PREFIX}" "${FORMAT}" <<'PY'
 import sys
@@ -68,10 +76,12 @@ schema = pa.schema([pa.field("n", dictionary_nested.type)])
 with new_writer(f"{prefix}_dictionary_nested.{fmt}", schema) as w:
     w.write_batch(pa.record_batch([dictionary_nested], schema=schema))
 PY
-    echo "--- ${FORMAT}: Nested subcolumn target n.d Array(Int32) ---"
-    ${CLICKHOUSE_LOCAL} --query "SELECT * FROM file('${PREFIX}_nested.${FORMAT}', '${FORMAT}', '\`n.d\` Array(Int32)')"
-    rm -f "${PREFIX}_nested.${FORMAT}"
-    echo "--- ${FORMAT}: dictionary-encoded Nested column, subcolumn target n.d Array(Int32) ---"
-    ${CLICKHOUSE_LOCAL} --query "SELECT * FROM file('${PREFIX}_dictionary_nested.${FORMAT}', '${FORMAT}', '\`n.d\` Array(Int32)')"
-    rm -f "${PREFIX}_dictionary_nested.${FORMAT}"
-done
+    echo "SELECT '--- ${FORMAT}: Nested subcolumn target n.d Array(Int32) ---';"
+    write_query "SELECT * FROM file('${PREFIX}_nested.${FORMAT}', '${FORMAT}', '\`n.d\` Array(Int32)')"
+
+    echo "SELECT '--- ${FORMAT}: dictionary-encoded Nested column, subcolumn target n.d Array(Int32) ---';"
+    write_query "SELECT * FROM file('${PREFIX}_dictionary_nested.${FORMAT}', '${FORMAT}', '\`n.d\` Array(Int32)')"
+done > "$TMP_DIR/queries.sql"
+
+${CLICKHOUSE_LOCAL} --path "$TMP_DIR/local" --max_threads=1 --allow_suspicious_low_cardinality_types=1 \
+    --multiquery --queries-file "$TMP_DIR/queries.sql"

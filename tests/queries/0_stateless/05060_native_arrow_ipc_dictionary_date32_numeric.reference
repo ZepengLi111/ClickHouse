@@ -4,7 +4,6 @@
 --- Arrow: Decimal target ---
 2932996
 --- Arrow: Date32 target still rejects the out-of-range day ---
-VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE
 --- Arrow: Nested subcolumn target n.d Array(Int32) ---
 [3000000,19000]
 [3000000]
@@ -18,7 +17,6 @@ VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE
 --- ArrowStream: Decimal target ---
 2932996
 --- ArrowStream: Date32 target still rejects the out-of-range day ---
-VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE
 --- ArrowStream: Nested subcolumn target n.d Array(Int32) ---
 [3000000,19000]
 [3000000]

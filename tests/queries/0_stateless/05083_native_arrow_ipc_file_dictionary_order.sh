@@ -100,16 +100,16 @@ struct.pack_into("<q", data, field(data, dictionary_batch, 0), 0)
 PYEOF
 
 for CASE in interleaved records_first reversed_dictionaries; do
-    echo "$CASE"
-    ${CLICKHOUSE_LOCAL} --path "${TMP_DIR}/local" --max_threads=1 --query "
-        SELECT a, b FROM file('${TMP_DIR}/${CASE}.arrow', 'Arrow', 'a String, b String')"
-done
+    cat <<SQL
+SELECT '${CASE}';
+SELECT a, b FROM file('${TMP_DIR}/${CASE}.arrow', 'Arrow', 'a String, b String');
+SQL
+done > "$TMP_DIR/queries.sql"
 
-if ${CLICKHOUSE_LOCAL} --path "${TMP_DIR}/local" --calculate_text_stack_trace=0 --query "
-    SELECT a FROM file('${TMP_DIR}/duplicate_base.arrow', 'Arrow', 'a String, b String')" \
-    > "${TMP_DIR}/duplicate.out" 2> "${TMP_DIR}/duplicate.err"; then
-    echo "Expected duplicate base dictionary metadata to be rejected"
-    exit 1
-fi
-grep -qF 'Arrow IPC file contains a replacement for dictionary id 0' "${TMP_DIR}/duplicate.err"
-echo 'Duplicate base dictionary rejected'
+cat >> "$TMP_DIR/queries.sql" <<SQL
+SELECT a FROM file('${TMP_DIR}/duplicate_base.arrow', 'Arrow', 'a String, b String'); -- { serverError INCORRECT_DATA }
+SELECT 'Duplicate base dictionary rejected';
+SQL
+
+${CLICKHOUSE_LOCAL} --path "$TMP_DIR/local" --max_threads=1 \
+    --multiquery --queries-file "$TMP_DIR/queries.sql"
