@@ -1538,9 +1538,13 @@ protected:
             tryForgetTask(task);
 
             if (task_status.status != "Finished")
-                throw Exception(ErrorCodes::RECEIVED_ERROR_FROM_REMOTE_IO_SERVER,
-                    "Task {} did not finish successfully (status: {}): {}",
+            {
+                /// Under the worker's error code, so the client sees it. A status other than `Failed`
+                /// carries no code.
+                const int code = task_status.error_code != 0 ? task_status.error_code : ErrorCodes::RECEIVED_ERROR_FROM_REMOTE_IO_SERVER;
+                throw Exception(code, "Task {} did not finish successfully (status: {}): {}",
                     task.task_id, task_status.status, task_status.error_message);
+            }
 
             /// Update task state
             setTaskFinished(stage_name, task.task_id);

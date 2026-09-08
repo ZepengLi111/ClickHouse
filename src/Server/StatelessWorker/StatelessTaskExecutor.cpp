@@ -28,6 +28,20 @@ namespace DB
 /// TODO: move
 std::pair<ObjectStoragePtr, String> getObjectStorageForTemporaryFiles(const String & unique_temp_file_path, ContextPtr context);
 
+namespace
+{
+
+/// The in-flight exception as the initiator reports it. Not `what()`: for a Poco exception that is
+/// only the exception's name.
+StatelessTaskExecutor::TaskFailure currentTaskFailure()
+{
+    return {
+        getCurrentExceptionCode(),
+        getCurrentExceptionMessage(/*with_stacktrace=*/ false, /*check_embedded_stacktrace=*/ false, /*with_extra_info=*/ false, /*with_version=*/ false)};
+}
+
+}
+
 StatelessTaskExecutor::StatelessTaskExecutor(size_t max_threads, size_t max_free_threads, size_t queue_size)
     : thread_pool(
         CurrentMetrics::StatelessWorkerThreads,
@@ -76,7 +90,7 @@ StatelessTaskExecutor::Result StatelessTaskExecutor::startTask(const String & un
 
     auto [object_storage, object_storage_path] = getObjectStorageForTemporaryFiles(unique_temp_file_path, query_context);
 
-    std::shared_ptr<std::promise<String>> task_promise = std::make_shared<std::promise<String>>();
+    auto task_promise = std::make_shared<std::promise<std::optional<TaskFailure>>>();
     auto task_state = std::make_shared<TaskState>();
     task_state->completion_future = task_promise->get_future();
 
@@ -120,18 +134,13 @@ StatelessTaskExecutor::Result StatelessTaskExecutor::startTask(const String & un
             /// exchanges use the streaming/persisted transports rather than in-memory queues.
             doExecuteTask(task_description, object_storage, object_storage_path, distributed_query_id, query_context,
                 /*execute_locally=*/false, is_task_cancelled, update_progress);
-            task_promise->set_value("");
-        }
-        catch (std::exception & e)
-        {
-            tryLogCurrentException(getLogger("StatelessTaskExecutor"),
-                fmt::format("Task {} failed", task_description.task.task_id));
-            task_promise->set_value(e.what());
+            task_promise->set_value(std::nullopt);
         }
         catch (...)
         {
-            tryLogCurrentException(__PRETTY_FUNCTION__);
-            task_promise->set_value("unknown exception");
+            tryLogCurrentException(getLogger("StatelessTaskExecutor"),
+                fmt::format("Task {} failed", task_description.task.task_id));
+            task_promise->set_value(currentTaskFailure());
         }
     };
 
@@ -145,7 +154,7 @@ StatelessTaskExecutor::Result StatelessTaskExecutor::startTask(const String & un
         /// half-published entry so `get_status` doesn't report "running" forever
         /// for a task no thread is executing, and complete the promise with the
         /// scheduling exception so future waiters fail fast.
-        task_promise->set_value(getCurrentExceptionMessage(/*with_stacktrace*/ false));
+        task_promise->set_value(currentTaskFailure());
         std::lock_guard lock(tasks_mutex);
         tasks.erase(unique_task_id);
         throw;
@@ -157,7 +166,7 @@ StatelessTaskExecutor::Result StatelessTaskExecutor::startTask(const String & un
 StatelessTaskExecutor::TaskStatus StatelessTaskExecutor::getStatus(const String & task_id, UInt64 wait_milliseconds)
 {
     /// Make a copy of task completion future to wait for it outside of the lock
-    std::shared_future<String> completion_future;
+    std::shared_future<std::optional<TaskFailure>> completion_future;
     std::shared_ptr<Progress> progress;
     {
         std::lock_guard lock(tasks_mutex);
@@ -175,11 +184,10 @@ StatelessTaskExecutor::TaskStatus StatelessTaskExecutor::getStatus(const String 
     }
 
     Progress progress_delta = progress->fetchAndResetPiecewiseAtomically();
-    auto error_message = completion_future.get();
-    if (error_message.empty())
+    const auto & failure = completion_future.get();
+    if (!failure)
         return TaskStatus{Result::TaskFinished, "", std::move(progress_delta)};
-    else
-        return TaskStatus{Result::TaskFailed, error_message, std::move(progress_delta)};
+    return TaskStatus{Result::TaskFailed, failure->message, std::move(progress_delta), failure->code};
 }
 
 StatelessTaskExecutor::Result StatelessTaskExecutor::cancelTask(const String & task_id)
