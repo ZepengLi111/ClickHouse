@@ -1226,7 +1226,12 @@ void registerAggregateFunctionHierarchicalKMeans(AggregateFunctionFactory & fact
     FunctionDocumentation::ReturnedValue returned_value =
         {"An array of up to k centroids, capped by the number of input rows.", {"Array(Array(Float32))"}};
     FunctionDocumentation::Examples examples = {
-        {"Basic usage", "SELECT length(hierarchicalKMeans(256)(vec)) FROM sample", ""}
+        {"Basic usage",
+         "SELECT length(hierarchicalKMeans(4)(vec)) FROM (SELECT [toFloat32(number % 4), toFloat32(number % 4)] AS vec FROM numbers(100))",
+         "4"},
+        {"Well-separated clusters",
+         "SELECT arraySort(hierarchicalKMeans(4)(vec)) FROM (SELECT [toFloat32(intDiv(number, 25)) * 100, toFloat32(0)] AS vec FROM numbers(100))",
+         "[[0,0],[100,0],[200,0],[300,0]]"}
     };
     FunctionDocumentation::IntroducedIn introduced_in = {26, 8};
     FunctionDocumentation::Category category = FunctionDocumentation::Category::MachineLearning;
