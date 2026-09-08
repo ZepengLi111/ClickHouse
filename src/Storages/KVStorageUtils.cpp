@@ -6,6 +6,8 @@
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnSet.h>
 #include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/Utils.h>
 #include <Common/assert_cast.h>
 
@@ -139,9 +141,18 @@ bool traverseDAGFilterSingleColumn(
         if (value->type != ActionsDAG::ActionType::COLUMN)
             return false;
 
-        auto converted_field = convertFieldToType(value->column->getField(), *primary_key_type);
-        if (!converted_field.isNull())
-            res->push_back(converted_field);
+        /// The type of the literal decides how it converts: a `DateTime` literal compared with a `Date`
+        /// key is a number of seconds, not a day number, so without the source type its raw value is
+        /// reinterpreted in the key's unit space and the lookup probes a key that does not exist.
+        auto converted_field = tryConvertFieldToType(value->column->getField(), *primary_key_type, value->result_type.get());
+
+        /// A literal the key type cannot represent - `Date = <a DateTime with a time of day>`, or a
+        /// value out of the key type's range - is not a key filter: the condition is left to be
+        /// evaluated over a full scan, instead of looking up an empty set of keys and answering no rows.
+        if (converted_field.isNull())
+            return false;
+
+        res->push_back(converted_field);
         return true;
     }
     if (func_name == "in" || func_name == "globalIn")
@@ -294,12 +305,19 @@ bool traverseDAGFilter(
             if (tuple_value.size() != primary_keys.size())
                 return false;
 
-            // Convert each tuple element to the correct type
+            // Convert each tuple element to the correct type, with the type of the element it comes
+            // from: without it a date-family literal is reinterpreted in the key's unit space.
+            const auto * value_tuple_type = typeid_cast<const DataTypeTuple *>(removeNullable(removeLowCardinality(right->result_type)).get());
+
             std::vector<Field> converted_values;
             converted_values.reserve(tuple_value.size());
             for (size_t i = 0; i < tuple_value.size(); ++i)
             {
-                auto converted = convertFieldToType(tuple_value[i], *primary_key_types[i]);
+                const IDataType * element_type = value_tuple_type && i < value_tuple_type->getElements().size()
+                    ? value_tuple_type->getElements()[i].get()
+                    : nullptr;
+
+                auto converted = tryConvertFieldToType(tuple_value[i], *primary_key_types[i], element_type);
                 if (converted.isNull())
                     return false;
                 converted_values.push_back(converted);
