@@ -1144,14 +1144,6 @@ static WorkerAddress resolveWorkerAddress(
     return address;
 }
 
-UInt64 chooseTaskSerializationVersion(const ExchangeStreamSources & exchange_stream_sources, UInt64 destination_exchange_port)
-{
-    for (const auto & stream : exchange_stream_sources.stream_hosts)
-        if (stream.second.port != destination_exchange_port)
-            return 2;
-    return 1;
-}
-
 TaskToHostMap::TaskToHostMap(const DistributedQueryPlan & distributed_query_plan_, ContextPtr context_)
 {
     /// Only constructed for a plan that runs on workers; a local plan gets a null map instead.
@@ -1813,12 +1805,6 @@ protected:
                 String input_stream_name = input_stream.toString();
                 task_description.exchange_stream_sources.stream_hosts[input_stream_name] = task_to_host_map->getExchangeStreamSourceHosts().at(input_stream_name);
             }
-            /// A version-1 consumer dials producers on its own exchange port, so the decision must
-            /// compare against the destination worker's port, not the initiator's.
-            const auto & destination_worker = task_to_host_map->getTaskHosts().at(task.task_id);
-            task_description.serialization_version = chooseTaskSerializationVersion(
-                task_description.exchange_stream_sources, destination_worker.streaming_exchange_port);
-
             /// Send the task before registering it: status polling does not tolerate
             /// UnknownTaskId, so a tracker poll racing the start would abort the query.
             /// On send failure clean up directly in case the worker did accept the start;
