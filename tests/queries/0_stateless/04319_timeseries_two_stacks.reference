@@ -39,19 +39,3 @@ dense average-path two-stack values match a fresh single-grid-point aggregate (a
 1
 1
 1
-signed-zero ties keep the earliest sample (1/max: -inf, -inf, -inf, inf):
--inf
--inf
--inf
-inf
-all-NaN windows keep the latest payload (FFF800000000000A x4):
-FFF800000000000A
-FFF800000000000A
-FFF800000000000A
-FFF800000000000A
-same-timestamp ties are order-independent (FFF800000000000A x3, then -inf, -inf):
-FFF800000000000A
-FFF800000000000A
-FFF800000000000A
--inf
--inf

@@ -117,6 +117,18 @@ namespace
                  /* drop_metric_name = */ true,
              }},
 
+            {"ts_of_max_over_time",
+             {
+                 "timeSeriesTimestampOfMaxToGrid",
+                 /* drop_metric_name = */ true,
+             }},
+
+            {"ts_of_min_over_time",
+             {
+                 "timeSeriesTimestampOfMinToGrid",
+                 /* drop_metric_name = */ true,
+             }},
+
             {"deriv",
              {
                  "timeSeriesDerivToGrid",
@@ -161,8 +173,6 @@ namespace
             /// present_over_time
             /// absent_over_time
             /// mad_over_time
-            /// ts_of_min_over_time
-            /// ts_of_max_over_time
             /// ts_of_last_over_time
             /// first_over_time
             /// ts_of_first_over_time

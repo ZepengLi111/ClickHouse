@@ -11,10 +11,13 @@
 /// Run:   `clickhouse-examples timeseries_to_grid_two_stack_vs_recompute`
 
 #include <AggregateFunctions/TimeSeries/AggregateFunctionTimeseriesCompensatedSum.h>
-#include <AggregateFunctions/TimeSeries/AggregateFunctionTimeseriesExtremumOverTime.h>
 #include <AggregateFunctions/TimeSeries/AggregateFunctionTimeseriesLinearRegression.h>
+#include <AggregateFunctions/TimeSeries/AggregateFunctionTimeseriesMax.h>
+#include <AggregateFunctions/TimeSeries/AggregateFunctionTimeseriesMin.h>
 #include <AggregateFunctions/TimeSeries/AggregateFunctionTimeseriesSamples.h>
 
+#include <Common/DateLUT.h>
+#include <Common/DateLUTImpl.h>
 #include <Common/Stopwatch.h>
 #include <Common/UnorderedMapWithMemoryTracking.h>
 
@@ -23,6 +26,7 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <ctime>
 #include <limits>
 #include <vector>
 
@@ -45,8 +49,8 @@ constexpr int REPEATS = 3;
 constexpr size_t WINDOWS[]
     = {2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 28, 32, 36, 40};
 
-/// One bucket map per series. The bucket type is per aggregator family: the linear-regression, compensated-sum
-/// and extremum families all store raw samples (`AggregateFunctionTimeseriesSamples`).
+/// One bucket map per series. The bucket type is per aggregator family: most store raw samples
+/// (`AggregateFunctionTimeseriesSamples`), while the maximum stores its `Summary` directly.
 template <typename Bucket>
 using Dataset = std::vector<UnorderedMapWithMemoryTracking<size_t, Bucket>>;  /// STYLE_CHECK_ALLOW_STD_CONTAINERS
 
@@ -133,6 +137,8 @@ void runFunction(const char * name, const Dataset<Bucket> & dataset, const MakeA
 
 int mainEntryExampleTimeSeriesToGridTwoStackVsRecompute(int, char **)
 {
+    fmt::println("timeSeries*ToGrid: two-stacks vs recompute, measured on {}.", DateLUT::instance().dateToString(time(nullptr)));
+
     Float64 checksum = 0;
 
     /// Linear regression (`timeSeriesDerivToGrid` / `timeSeriesPredictLinearToGrid` share the same `Summary`, so
@@ -149,10 +155,16 @@ int mainEntryExampleTimeSeriesToGridTwoStackVsRecompute(int, char **)
         [](size_t stack_size) { return CompensatedSumTraits::Aggregator{stack_size}; },
         checksum);
 
-    /// Extremum (`timeSeriesMaxToGrid` / `timeSeriesMinToGrid` share the same `Summary`; max is measured).
-    using ExtremumTraits = AggregateFunctionTimeseriesExtremumOverTimeTraits<UInt32, /* IntervalType */ Int32, /* ValueType */ Float64, /* is_max */ true>;
-    runFunction("timeSeriesMaxToGrid", buildDataset<typename ExtremumTraits::Bucket>(),
-        [](size_t stack_size) { return typename ExtremumTraits::Aggregator{stack_size}; },
+    /// Maximum (`timeSeriesMaxToGrid` / `timeSeriesTimestampOfMaxToGrid` differ only in the result; the buckets are summaries).
+    using MaxTraits = AggregateFunctionTimeseriesMaxTraits<UInt32, /* IntervalType */ Int32, /* ValueType */ Float64, /* return_timestamp */ false>;
+    runFunction("timeSeriesMaxToGrid", buildDataset<typename MaxTraits::Bucket>(),
+        [](size_t stack_size) { return typename MaxTraits::Aggregator{stack_size, /* timestamp_scale_multiplier */ UInt32(1)}; },
+        checksum);
+
+    /// Minimum (`timeSeriesMinToGrid` / `timeSeriesTimestampOfMinToGrid` differ only in the result; the buckets are raw samples).
+    using MinTraits = AggregateFunctionTimeseriesMinTraits<UInt32, /* IntervalType */ Int32, /* ValueType */ Float64, /* return_timestamp */ false>;
+    runFunction("timeSeriesMinToGrid", buildDataset<typename MinTraits::Bucket>(),
+        [](size_t stack_size) { return typename MinTraits::Aggregator{stack_size, /* timestamp_scale_multiplier */ UInt32(1)}; },
         checksum);
 
     /// Add other non-invertible functions here.
@@ -163,29 +175,3 @@ int mainEntryExampleTimeSeriesToGridTwoStackVsRecompute(int, char **)
 
     return 0;
 }
-
-/// Reference output for `timeSeriesSumToGrid`, measured on 2026-09-04 in a release build; the thresholds of
-/// `AggregateFunctionTimeseriesCompensatedSumTraits` are based on it:
-///
-/// timeSeriesSumToGrid: two-stacks vs recompute, ns per grid point (32 series x 8000 buckets).
-///
-///   buckets_per_window   recompute(ns)  two_stacks(ns)  ratio (recompute / two_stacks)      winner
-///                    2            7.15            8.82                            0.81   recompute
-///                    4            9.16            9.33                            0.98   recompute
-///                    6           11.19            9.61                            1.16  two-stacks
-///                    8           12.97            9.71                            1.34  two-stacks
-///                   10           15.31            9.84                            1.56  two-stacks
-///                   12           16.99           10.12                            1.68  two-stacks
-///                   14           18.55           10.39                            1.79  two-stacks
-///                   16           20.16           10.20                            1.98  two-stacks
-///                   18           23.06           10.15                            2.27  two-stacks
-///                   20           23.95           10.13                            2.36  two-stacks
-///                   22           26.60           10.08                            2.64  two-stacks
-///                   24           28.05           10.04                            2.79  two-stacks
-///                   28           32.58           10.08                            3.23  two-stacks
-///                   32           37.74           10.00                            3.77  two-stacks
-///                   36           41.53            9.89                            4.20  two-stacks
-///                   40           46.69            9.82                            4.75  two-stacks
-///
-///   AVG_POPULATED_BPW_TO_ENABLE_TWO_STACKS (two-stacks first wins)   = 6
-///   BPW_TO_FORCE_TWO_STACKS (two-stacks > 2x faster)                 = 18
