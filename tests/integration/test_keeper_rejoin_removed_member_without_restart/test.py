@@ -62,11 +62,13 @@ def committed_index(node) -> int:
 def test_rejoin_removed_member_without_restart(started_cluster):
     global zk1, zk3
 
-    zk1 = create_client(node1)
-    zk3 = create_client(node3)
-
+    # Wait before connecting: a client built against a keeper that has not finished coming
+    # up blocks in its constructor rather than failing.
     for node in [node1, node2, node3]:
         ku.wait_until_connected(cluster, node)
+
+    zk1 = create_client(node1)
+    zk3 = create_client(node3)
 
     # Give every member something committed of its own, so the removal below leaves
     # node3 holding state rather than starting from nothing.
