@@ -575,7 +575,7 @@ public:
         auto accumulate = [&](std::string_view ngram)
         {
             auto key = PackedStringRef::build(ngram.data(), ngram.size(), PackedStringRefHash{});
-            auto it = ngram_to_index.find(key);
+            const auto *it = ngram_to_index.find(key);
             if (!it)
                 return;
             ++matched_ngrams;
