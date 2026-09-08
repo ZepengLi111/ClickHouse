@@ -81,18 +81,23 @@ SELECT 'B4 query constant capturing lambda still extracted',
             explain_query_plan_default = 'pretty', query_plan_filter_push_down = 1,
             use_join_disjunctions_push_down = 0, enable_join_runtime_filters = 0);
 
--- The same hidden call, in a lambda that CAPTURES a column, so the guard has to reach the body through
--- a `FunctionCapture` node instead of B3's folded `ColumnFunction`: two separate overrides of
--- `isDeterministicInScopeOfQuery`, so a regression in either one has to redden a row.
-SELECT 'B5 hidden non deterministic capturing lambda', abs((
-    (SELECT count() FROM (
-        SELECT t_left_big.a FROM t_left_big LEFT JOIN t_right_big ON t_left_big.a = t_right_big.a
-        WHERE arrayExists(z -> rand(z + t_left_big.a) % 2 = 0, [t_left_big.a])) SETTINGS
-            query_plan_filter_push_down = 1, use_join_disjunctions_push_down = 1) /
-    (SELECT count() FROM (
-        SELECT t_left_big.a FROM t_left_big LEFT JOIN t_right_big ON t_left_big.a = t_right_big.a
-        WHERE arrayExists(z -> rand(z + t_left_big.a) % 2 = 0, [t_left_big.a])) SETTINGS
-            query_plan_filter_push_down = 0)) - 1.) < 0.05;
+-- The rejection direction of B4's shape: a disjunction spanning both sides cannot be moved below the
+-- join by the main push-down, so only the partial path can act and the plan says whether it extracted
+-- the lambda. B4's `>` on the same shape is this row's non-vacuity witness: if the plan stopped
+-- printing the lambda at all, B4 goes red first.
+SELECT 'B5 non deterministic capturing lambda not extracted',
+    (SELECT countIf(explain ILIKE '%arrayExists%') FROM (
+        EXPLAIN SELECT t_left_big.a FROM t_left_big JOIN t_right_big ON t_left_big.a = t_right_big.a
+        WHERE (arrayExists(z -> rand(z + t_left_big.a) % 2 = 0, [t_left_big.a]) AND t_right_big.b = 7)
+           OR (arrayExists(z -> rand(z + t_left_big.a) % 2 = 1, [t_left_big.a]) AND t_right_big.b = 8)) SETTINGS
+            explain_query_plan_default = 'pretty', query_plan_filter_push_down = 1,
+            use_join_disjunctions_push_down = 1, enable_join_runtime_filters = 0)
+  = (SELECT countIf(explain ILIKE '%arrayExists%') FROM (
+        EXPLAIN SELECT t_left_big.a FROM t_left_big JOIN t_right_big ON t_left_big.a = t_right_big.a
+        WHERE (arrayExists(z -> rand(z + t_left_big.a) % 2 = 0, [t_left_big.a]) AND t_right_big.b = 7)
+           OR (arrayExists(z -> rand(z + t_left_big.a) % 2 = 1, [t_left_big.a]) AND t_right_big.b = 8)) SETTINGS
+            explain_query_plan_default = 'pretty', query_plan_filter_push_down = 1,
+            use_join_disjunctions_push_down = 0, enable_join_runtime_filters = 0);
 
 DROP TABLE t_left_big;
 DROP TABLE t_right_big;
