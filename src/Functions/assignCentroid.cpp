@@ -562,11 +562,18 @@ REGISTER_FUNCTION(AssignCentroid)
     FunctionDocumentation::Description description =
         "Returns the id of the nearest (L2) centroid to a vector. The centroids are given as a constant "
         "array of float arrays, where the id is the 0-based position in that array, or as the name of a "
-        "Dictionary holding columns (cid, vec), where the id is the cid.";
+        "`Dictionary` holding the attributes `cid` and `vec`, where the id is `cid`.";
     FunctionDocumentation::Syntax syntax = "assignCentroid(vec, centroids | dict_name)";
     FunctionDocumentation::Arguments arguments = {
-        {"vec", "Input vector.", {"Array(Float32)", "Array(Float64)", "Array(BFloat16)"}},
-        {"centroids", "Constant centroids as Array(Array(Float32)), or a constant dictionary name.", {"Array(Array(Float32))", "String"}}
+        {"vec", "Vector to assign. Its dimension must match the dimension of the centroids. Widths other than "
+                "`Float32` are converted to `Float32`, which is what the scoring kernel uses.",
+         {"Array(Float32)", "Array(Float64)", "Array(BFloat16)"}},
+        {"centroids", "The centroids to score against, which must be constant. Given as an array of equally sized, "
+                      "non-empty float arrays, the id then being the 0-based position in that array; or as the name of "
+                      "a `Dictionary` with an attribute `cid` of an unsigned integer type that fits `UInt32` and an "
+                      "attribute `vec` of type `Array(Float32)`, the id then being `cid`. The dictionary is read once "
+                      "and cached until it reloads.",
+         {"Array(Array(Float32))", "Array(Array(Float64))", "Array(Array(BFloat16))", "String"}}
     };
     FunctionDocumentation::ReturnedValue returned_value = {"The nearest centroid id.", {"UInt32"}};
     FunctionDocumentation::Examples examples = {

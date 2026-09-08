@@ -1004,8 +1004,6 @@ public:
                 "hierarchicalKMeans: sample_cap ({}) must be at least k ({}), otherwise the reservoir cannot "
                 "hold enough points to train k centroids", sample_cap, k);
 
-        /// `add` reads the nested column as `ColumnFloat32`, so `Float32` is required exactly - accepting any float
-        /// here would reinterpret e.g. `Float64` payload as `Float32` and silently train on garbage.
         /// Any float width is accepted and converted to the Float32 the kernels use, so a plain array
         /// literal - which is Array(Float64) - works without an explicit CAST.
         const auto * array_type = typeid_cast<const DataTypeArray *>(args[0].get());
@@ -1213,15 +1211,33 @@ void registerAggregateFunctionHierarchicalKMeans(AggregateFunctionFactory & fact
 void registerAggregateFunctionHierarchicalKMeans(AggregateFunctionFactory & factory)
 {
     FunctionDocumentation::Description description =
-        "Trains up to k cluster centroids from the aggregated vectors using hierarchical k-means and returns "
-        "them as Array(Array(Float32)). Fewer than k are returned only when the input has fewer than k rows, "
-        "since a row can yield at most one centroid; repeated points still yield k. Distance is squared L2; "
+        "Trains up to `k` cluster centroids from the aggregated vectors using hierarchical k-means and returns "
+        "them as `Array(Array(Float32))`. Fewer than `k` are returned only when the input has fewer than `k` rows, "
+        "since a row can yield at most one centroid; repeated points still yield `k`. Distance is squared L2; "
         "pass `spherical = 1` to "
         "renormalize the centroids to unit length after each iteration, which makes the same centroids an exact "
         "cosine/inner-product quantizer.";
     FunctionDocumentation::Syntax syntax = "hierarchicalKMeans(k[, branching[, max_iter[, sample_cap[, seed[, spherical]]]]])(vec)";
     FunctionDocumentation::Arguments arguments = {
-        {"vec", "Input vector to cluster.", {"Array(Float32)"}}
+        {"vec", "Vector to cluster. Every row must have the same dimension, and every coordinate must be finite. "
+                "Widths other than `Float32` are converted to `Float32`, which is what the training kernels use.",
+         {"Array(Float32)", "Array(Float64)", "Array(BFloat16)"}}
+    };
+    FunctionDocumentation::Parameters parameters = {
+        {"k", "Number of centroids to train. Must be greater than 0 and must not exceed `sample_cap`.", {"UInt*"}},
+        {"branching", "Optional. Fan-out of the hierarchy: a node that must produce more than `branching` centroids is "
+                      "split into `branching` children instead of being clustered directly. Must be at least 2. Default value: 16.",
+         {"UInt*"}},
+        {"max_iter", "Optional. Upper bound on the number of Lloyd iterations per node; a node stops early once no point "
+                     "changes cluster. Must be greater than 0. Default value: 20.", {"UInt*"}},
+        {"sample_cap", "Optional. Capacity of the reservoir the aggregate samples into, which bounds the state at "
+                       "`sample_cap * dim` floats however many rows are aggregated. Must be at least `k` and at most "
+                       "4294967295. Default value: 1000000.", {"UInt*"}},
+        {"seed", "Optional. Seed of the reservoir sampling and of the k-means++ initialization. A given seed makes "
+                 "training reproducible for a given input order. Default value: 0.", {"UInt*"}},
+        {"spherical", "Optional. Set to 1 to renormalize the centroids to unit length after every iteration, which makes "
+                      "them an exact cosine/inner-product quantizer. Zero-norm input vectors are then rejected, because "
+                      "cosine is undefined for a vector with no direction. Default value: 0.", {"UInt*"}}
     };
     FunctionDocumentation::ReturnedValue returned_value =
         {"An array of up to k centroids, capped by the number of input rows.", {"Array(Array(Float32))"}};
@@ -1235,7 +1251,7 @@ void registerAggregateFunctionHierarchicalKMeans(AggregateFunctionFactory & fact
     };
     FunctionDocumentation::IntroducedIn introduced_in = {26, 8};
     FunctionDocumentation::Category category = FunctionDocumentation::Category::MachineLearning;
-    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+    FunctionDocumentation documentation = {description, syntax, arguments, parameters, returned_value, examples, introduced_in, category};
 
     /// Order-dependent: the `k >= n` shortcut emits points in arrival order, and Algorithm R consumes RNG
     /// draws by stream position. Claiming otherwise lets `removeRedundantSorting` drop an upstream `ORDER BY`
