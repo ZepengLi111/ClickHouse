@@ -9,7 +9,6 @@
 #include <Server/DistributedQuery/StreamingExchangeProtocol.h>
 #include <Poco/Net/StreamSocket.h>
 #include <IO/ReadBufferFromMemory.h>
-#include <IO/WriteBufferFromPocoSocket.h>
 
 namespace DB
 {
@@ -29,8 +28,6 @@ public:
         wait_events_epoll.add(output_update_wakeup.fd());
 #endif
     }
-
-    ~StreamingExchangeSource() override;
 
     String getName() const override { return "StreamingExchangeSource(" + stream_name + ")"; }
 
@@ -58,7 +55,8 @@ private:
     /// Read available data from the socket and deserialize a chunk when enough data was read.
     std::optional<Chunk> tryGenerate() override;
 
-    /// Tell the sender that no more data is needed from it.
+    /// Tell the sender that no more data is needed from it. Throws `EXCHANGE_PEER_DISCONNECTED` if the
+    /// sender is gone.
     void sendNoMoreDataNeeded();
 
     const String host;
@@ -86,7 +84,6 @@ private:
 
     std::unique_ptr<Poco::Net::StreamSocket> socket;
     std::unique_ptr<ReadBufferFromMemory> packet_in;    /// One full packet
-    std::unique_ptr<WriteBufferFromPocoSocket> out;
     size_t rows_read = 0;
     size_t bytes_read = 0;
 

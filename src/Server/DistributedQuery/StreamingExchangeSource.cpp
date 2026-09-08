@@ -7,10 +7,12 @@
 #include <Core/ProtocolDefines.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
-#include <IO/WriteBufferFromPocoSocket.h>
+#include <IO/WriteBufferFromString.h>
 #include <Poco/Net/NetException.h>
+#include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <Common/PODArray.h>
+#include <base/scope_guard.h>
 #include <base/types.h>
 
 namespace DB
@@ -20,12 +22,7 @@ namespace ErrorCodes
 {
     extern const int UNEXPECTED_PACKET_FROM_CLIENT;
     extern const int PROTOCOL_VERSION_MISMATCH;
-}
-
-StreamingExchangeSource::~StreamingExchangeSource()
-{
-    if (out && !out->isFinalized())
-        out->cancel();
+    extern const int EXCHANGE_PEER_DISCONNECTED;
 }
 
 void StreamingExchangeSource::onStart()
@@ -83,11 +80,9 @@ void StreamingExchangeSource::sendHello()
         .bytes_size = body_str.size(),
     };
 
-    WriteBufferFromPocoSocket hello_out(*socket);
-    hello_out.write(reinterpret_cast<const char *>(&header), sizeof(header));
-    if (!body_str.empty())
-        hello_out.write(body_str.data(), body_str.size());
-    hello_out.finalize();
+    String packet(reinterpret_cast<const char *>(&header), sizeof(header));
+    packet += body_str;
+    StreamingExchangeProtocol::sendAll(*socket, packet.data(), packet.size(), "SourceHello for " + stream_name);
 }
 
 void StreamingExchangeSource::receiveHello()
@@ -205,10 +200,13 @@ void StreamingExchangeSource::onUpdatePorts()
 
 void StreamingExchangeSource::sendNoMoreDataNeeded()
 {
-    if (!out)
-        out = std::make_unique<WriteBufferFromPocoSocket>(*socket);
-    writeIntBinary(StreamingExchangeProtocol::PacketType::NoMoreDataNeeded, *out);
-    out->next();
+    /// Sent blocking, under the handshake's send timeout: the source sends nothing else, so the send
+    /// buffer is empty and the packet never waits.
+    socket->setBlocking(true);
+    SCOPE_EXIT(socket->setBlocking(false));
+    const UInt64 packet = StreamingExchangeProtocol::PacketType::NoMoreDataNeeded;
+    StreamingExchangeProtocol::sendAll(
+        *socket, reinterpret_cast<const char *>(&packet), sizeof(packet), "NoMoreDataNeeded for " + stream_name);
 }
 
 void StreamingExchangeSource::readFromSocket(char * buffer, size_t buffer_size, size_t & position)
@@ -216,6 +214,9 @@ void StreamingExchangeSource::readFromSocket(char * buffer, size_t buffer_size, 
     while (position < buffer_size)
     {
         ssize_t received = StreamingExchangeProtocol::tryReceive(*socket, buffer + position, buffer_size - position, stream_name);
+        if (received < 0)
+            throw Exception(ErrorCodes::EXCHANGE_PEER_DISCONNECTED, "Failed to receive {} from {}, peer closed connection",
+                stream_name, StreamingExchangeProtocol::describePeer(*socket));
         if (received == 0)
         {
             /// Socket is not ready for reading, wait for epoll event.
@@ -279,7 +280,19 @@ std::optional<Chunk> StreamingExchangeSource::tryGenerate()
     {
         LOG_TRACE(log, "NoMoreDataNeeded from exchange stream {}, total rows: {}, bytes: {}", stream_name, rows_read, bytes_read);
 
-        sendNoMoreDataNeeded();
+        /// Best effort: nothing more is needed from the peer, so a peer that is gone is no failure
+        /// here; it notices the closed socket by itself. Any other error is this source's own.
+        try
+        {
+            sendNoMoreDataNeeded();
+        }
+        catch (const Exception & e)
+        {
+            if (e.code() != ErrorCodes::EXCHANGE_PEER_DISCONNECTED)
+                throw;
+            LOG_TRACE(log, "Could not tell exchange stream {} that no more data is needed, the peer is gone: {}",
+                stream_name, e.message());
+        }
         finished_reading = true;
         return {};
     }
