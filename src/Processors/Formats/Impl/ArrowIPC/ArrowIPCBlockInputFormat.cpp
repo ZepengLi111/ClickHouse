@@ -32,9 +32,9 @@
 #include <DataTypes/DataTypeMap.h>
 #include <DataTypes/NestedUtils.h>
 #include <Core/UUID.h>
+#include <Formats/castColumnToRequestedType.h>
 #include <Formats/insertNullAsDefaultIfNeeded.h>
 #include <Interpreters/castColumn.h>
-#include <Common/quoteString.h>
 #include <algorithm>
 #include <Common/assert_cast.h>
 #include <boost/algorithm/string/case_conv.hpp>
@@ -1001,17 +1001,9 @@ Chunk ArrowIPCBlockInputFormat::buildChunk(ArrowIPC::RecordBatchDecoder::Decoded
 
         column = realignStructFieldsToRequested(std::move(column), header_column.type);
 
-        try
-        {
-            column.column = castColumn(column, header_column.type);
-        }
-        catch (Exception & e)
-        {
-            e.addMessage(fmt::format(
-                "while converting column {} from type {} to type {}",
-                backQuote(header_column.name), column.type->getName(), header_column.type->getName()));
-            throw;
-        }
+        /// Under case-insensitive matching the decoded column carries the source spelling of the name.
+        column.name = header_column.name;
+        castColumnToRequestedType(column, header_column.type);
         columns.push_back(std::move(column.column));
     }
 
