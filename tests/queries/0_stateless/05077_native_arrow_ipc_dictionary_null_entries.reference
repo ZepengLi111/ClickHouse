@@ -17,7 +17,6 @@ x
 y
 x
 --- non-nullable field: a row points at the null entry, rejected ---
-INCORRECT_DATA
 === ArrowStream
 --- nullable field: one row is null through the index, another points at the null entry ---
 x	LowCardinality(Nullable(String))
@@ -37,4 +36,3 @@ x
 y
 x
 --- non-nullable field: a row points at the null entry, rejected ---
-INCORRECT_DATA

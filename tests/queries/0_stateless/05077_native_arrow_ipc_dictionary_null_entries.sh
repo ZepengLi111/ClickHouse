@@ -5,6 +5,7 @@
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
+set -e
 
 TMP_DIR="${CLICKHOUSE_TMP}/${CLICKHOUSE_TEST_UNIQUE_NAME}"
 mkdir -p "$TMP_DIR"
@@ -41,15 +42,18 @@ write("non_nullable_referenced", [0, 1, 2], nullable=False)
 PYEOF
 
 for FORMAT in Arrow ArrowStream; do
-    echo "=== ${FORMAT}"
-    echo "--- nullable field: one row is null through the index, another points at the null entry ---"
-    ${CLICKHOUSE_LOCAL} --query "SELECT c, toTypeName(c) FROM file('${TMP_DIR}/nullable_referenced.${FORMAT}', '${FORMAT}')"
-    echo "--- nullable field: no row points at the null entry ---"
-    ${CLICKHOUSE_LOCAL} --query "SELECT c, toTypeName(c) FROM file('${TMP_DIR}/nullable_unreferenced.${FORMAT}', '${FORMAT}')"
-    echo "--- non-nullable field: no row points at the null entry ---"
-    ${CLICKHOUSE_LOCAL} --query "SELECT c, toTypeName(c) FROM file('${TMP_DIR}/non_nullable_unreferenced.${FORMAT}', '${FORMAT}')"
-    echo "--- non-nullable field read as String ---"
-    ${CLICKHOUSE_LOCAL} --query "SELECT c FROM file('${TMP_DIR}/non_nullable_unreferenced.${FORMAT}', '${FORMAT}', 'c String')"
-    echo "--- non-nullable field: a row points at the null entry, rejected ---"
-    ${CLICKHOUSE_LOCAL} --query "SELECT c FROM file('${TMP_DIR}/non_nullable_referenced.${FORMAT}', '${FORMAT}')" 2>&1 | grep -o "INCORRECT_DATA" | head -n 1
-done
+    echo "SELECT '=== ${FORMAT}';"
+    echo "SELECT '--- nullable field: one row is null through the index, another points at the null entry ---';"
+    echo "SELECT c, toTypeName(c) FROM file('${TMP_DIR}/nullable_referenced.${FORMAT}', '${FORMAT}');"
+    echo "SELECT '--- nullable field: no row points at the null entry ---';"
+    echo "SELECT c, toTypeName(c) FROM file('${TMP_DIR}/nullable_unreferenced.${FORMAT}', '${FORMAT}');"
+    echo "SELECT '--- non-nullable field: no row points at the null entry ---';"
+    echo "SELECT c, toTypeName(c) FROM file('${TMP_DIR}/non_nullable_unreferenced.${FORMAT}', '${FORMAT}');"
+    echo "SELECT '--- non-nullable field read as String ---';"
+    echo "SELECT c FROM file('${TMP_DIR}/non_nullable_unreferenced.${FORMAT}', '${FORMAT}', 'c String');"
+    echo "SELECT '--- non-nullable field: a row points at the null entry, rejected ---';"
+    echo "SELECT c FROM file('${TMP_DIR}/non_nullable_referenced.${FORMAT}', '${FORMAT}'); -- { serverError INCORRECT_DATA }"
+done > "$TMP_DIR/queries.sql"
+
+${CLICKHOUSE_LOCAL} --path "$TMP_DIR/local" --max_threads=1 \
+    --multiquery --queries-file "$TMP_DIR/queries.sql"

@@ -5,6 +5,7 @@
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
+set -e
 
 TMP_DIR="${CLICKHOUSE_TMP}/${CLICKHOUSE_TEST_UNIQUE_NAME}"
 mkdir -p "$TMP_DIR"
@@ -67,19 +68,19 @@ for name, value_type, entries in (
           [([first, second], [0]), ([third, None], [1])], formats=("ArrowStream",))
 PYEOF
 
-read_values()
+write_query()
 {
-    ${CLICKHOUSE_LOCAL} --allow_experimental_nullable_tuple_type=0 --query \
-        "SELECT ${EXPR} FROM file('${TMP_DIR}/${TYPE}_$1.${FORMAT}', '${FORMAT}', '${CH_TYPE}')" 2>&1
+    echo "SELECT ${EXPR} FROM file('${TMP_DIR}/${TYPE}_$1.${FORMAT}', '${FORMAT}', '${CH_TYPE}'); ${2:-}"
 }
 
+# Expected-error annotations let all cases share a process while checking each rejection independently.
 for FORMAT in Arrow ArrowStream; do
     TYPE=null
     CH_TYPE='c Nullable(Int64)'
     EXPR='c'
-    echo "${FORMAT} null: nullable field, non-nullable field"
-    read_values nullable
-    read_values referenced | grep -o 'references null dictionary entry [0-9]*' | head -n 1
+    echo "SELECT '${FORMAT} null: nullable field, non-nullable field';"
+    write_query nullable
+    write_query referenced "-- { serverError INCORRECT_DATA }"
 
     for TYPE in array map tuple; do
         case "$TYPE" in
@@ -87,19 +88,22 @@ for FORMAT in Arrow ArrowStream; do
             map) CH_TYPE='c Map(Int64, Int64)'; EXPR='sum(arraySum(mapValues(c)))' ;;
             tuple) CH_TYPE='c Tuple(a Int64)'; EXPR='sum(c.a)' ;;
         esac
-        echo "${FORMAT} ${TYPE}: unreferenced null, nullable field, appended null, base null"
-        read_values unreferenced
-        read_values nullable
-        read_values delta_added_unreferenced
-        read_values delta_base_unreferenced
-        echo "${FORMAT} ${TYPE}: referenced null, appended null, base null"
+        echo "SELECT '${FORMAT} ${TYPE}: unreferenced null, nullable field, appended null, base null';"
+        write_query unreferenced
+        write_query nullable
+        write_query delta_added_unreferenced
+        write_query delta_base_unreferenced
+        echo "SELECT '${FORMAT} ${TYPE}: referenced null, appended null, base null';"
         for CASE in referenced delta_added_referenced delta_base_referenced; do
-            read_values "$CASE" | grep -o 'references null dictionary entry [0-9]*' | head -n 1
+            write_query "$CASE" "-- { serverError INCORRECT_DATA }"
         done
         if [[ "$FORMAT" == ArrowStream ]]; then
-            echo "${FORMAT} ${TYPE}: replacement clears null, replacement adds null"
-            read_values replacement_clears_null
-            read_values replacement_adds_null | grep -o 'references null dictionary entry [0-9]*' | head -n 1
+            echo "SELECT '${FORMAT} ${TYPE}: replacement clears null, replacement adds null';"
+            write_query replacement_clears_null
+            write_query replacement_adds_null "-- { serverError INCORRECT_DATA }"
         fi
     done
-done
+done > "$TMP_DIR/queries.sql"
+
+${CLICKHOUSE_LOCAL} --path "$TMP_DIR/local" --max_threads=1 --allow_experimental_nullable_tuple_type=0 \
+    --multiquery --queries-file "$TMP_DIR/queries.sql"

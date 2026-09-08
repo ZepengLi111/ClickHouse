@@ -1,69 +1,46 @@
 Arrow null: nullable field, non-nullable field
 \N
-references null dictionary entry 0
 Arrow array: unreferenced null, nullable field, appended null, base null
 44
 44
 99
 44
 Arrow array: referenced null, appended null, base null
-references null dictionary entry 1
-references null dictionary entry 1
-references null dictionary entry 1
 Arrow map: unreferenced null, nullable field, appended null, base null
 444
 444
 999
 444
 Arrow map: referenced null, appended null, base null
-references null dictionary entry 1
-references null dictionary entry 1
-references null dictionary entry 1
 Arrow tuple: unreferenced null, nullable field, appended null, base null
 44
 44
 99
 44
 Arrow tuple: referenced null, appended null, base null
-references null dictionary entry 1
-references null dictionary entry 1
-references null dictionary entry 1
 ArrowStream null: nullable field, non-nullable field
 \N
-references null dictionary entry 0
 ArrowStream array: unreferenced null, nullable field, appended null, base null
 44
 44
 99
 44
 ArrowStream array: referenced null, appended null, base null
-references null dictionary entry 1
-references null dictionary entry 1
-references null dictionary entry 1
 ArrowStream array: replacement clears null, replacement adds null
 66
-references null dictionary entry 1
 ArrowStream map: unreferenced null, nullable field, appended null, base null
 444
 444
 999
 444
 ArrowStream map: referenced null, appended null, base null
-references null dictionary entry 1
-references null dictionary entry 1
-references null dictionary entry 1
 ArrowStream map: replacement clears null, replacement adds null
 666
-references null dictionary entry 1
 ArrowStream tuple: unreferenced null, nullable field, appended null, base null
 44
 44
 99
 44
 ArrowStream tuple: referenced null, appended null, base null
-references null dictionary entry 1
-references null dictionary entry 1
-references null dictionary entry 1
 ArrowStream tuple: replacement clears null, replacement adds null
 66
-references null dictionary entry 1
