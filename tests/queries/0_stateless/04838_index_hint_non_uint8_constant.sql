@@ -155,6 +155,19 @@ SELECT 'indexed falsy', count() FROM t_index_hint_bloom WHERE (id >= 1 AND id <=
 SELECT 'indexed truthy', count() FROM t_index_hint_set WHERE (id >= 1 AND id <= 3) AND indexHint(256);
 SELECT 'indexed truthy', count() FROM t_index_hint_minmax WHERE (id >= 1 AND id <= 3) AND indexHint(256);
 
+-- The rule is about the declared type, so a non-constant argument is dropped as well. A wide integer
+-- is an integer, so the `set` index used to read `toUInt256(v)` as `v != 0` through
+-- `__bitWrapperFunc` and prune away exactly the granules the query wanted.
+SELECT 'indexed no boolean nonconst', count() FROM t_index_hint_set WHERE v = 0 AND indexHint(toUInt256(v));
+SELECT 'indexed no boolean nonconst', count() FROM t_index_hint_set WHERE (id >= 1 AND id <= 3) AND indexHint(toUInt256(v));
+SELECT 'indexed no boolean nonconst', count() FROM t_index_hint_set WHERE (id >= 1 AND id <= 3) AND indexHint(toInt128(v));
+SELECT 'indexed no boolean nonconst', count() FROM t_index_hint_set WHERE (id >= 1 AND id <= 3) AND indexHint(toDecimal64(v, 0));
+SELECT 'indexed no boolean nonconst', count() FROM t_index_hint_minmax WHERE v = 0 AND indexHint(toUInt256(v));
+SELECT 'indexed no boolean nonconst', count() FROM t_index_hint_bloom WHERE v = 0 AND indexHint(toUInt256(v));
+-- The same expression under a type that does read as a condition still prunes: `v` is 0 for these
+-- rows, so the hint excludes them.
+SELECT 'indexed nonconst bool', count() FROM t_index_hint_set WHERE (id >= 1 AND id <= 3) AND indexHint(v);
+
 -- The set index itself must still prune on a condition it understands, and a constant false in an
 -- OR must still be skipped rather than making the whole OR look unusable.
 SELECT 'set index prunes', count() FROM t_index_hint_set WHERE indexHint(v = 3)

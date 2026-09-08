@@ -71,5 +71,12 @@ indexed falsy	0
 indexed falsy	0
 indexed truthy	3
 indexed truthy	3
+indexed no boolean nonconst	100
+indexed no boolean nonconst	3
+indexed no boolean nonconst	3
+indexed no boolean nonconst	3
+indexed no boolean nonconst	143
+indexed no boolean nonconst	143
+indexed nonconst bool	0
 set index prunes	192
 set index prunes	100
