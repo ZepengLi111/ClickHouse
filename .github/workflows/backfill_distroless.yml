@@ -265,6 +265,8 @@ jobs:
                 --label="com.clickhouse.build.version=${VERSION}-distroless" \
                 ${TAG_ARGS} \
                 --build-arg=VERSION="${VERSION}" \
+                --build-arg=apt_archive=http://us-east-1.ec2.archive.ubuntu.com \
+                --build-arg=apt_ports_archive=http://us-east-1.ec2.ports.ubuntu.com \
                 --progress=plain \
                 --file="${DOCKERFILE}" \
                 "${CONTEXT}"
