@@ -105,8 +105,8 @@ struct QueryPlanOptimizationSettings
     bool query_plan_optimize_join_order_use_conflict_detector_c = false;
 
     /// Whether unmatched outer-join rows are padded with real SQL NULLs (true) rather than type
-    /// defaults (false). The conflict detectors' null-rejection analysis (paper Definition 1) only
-    /// unlocks the footnoted assoc/asscom reorderings when the padded value is actually NULL, so with
+    /// defaults (false). The conflict detectors' null-rejection analysis only
+    /// unlocks reorderings when the padded value is actually NULL, so with
     /// `join_use_nulls = 0` no relation is treated as null-rejecting.
     bool join_use_nulls = false;
 
