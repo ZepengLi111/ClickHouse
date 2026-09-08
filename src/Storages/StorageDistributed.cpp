@@ -2552,7 +2552,9 @@ First, you can define which servers to write which data to and perform the write
 
 Second, you can perform `INSERT` statements on a `Distributed` table. In this case, the table will distribute the inserted data across the servers itself. In order to write to a `Distributed` table, it must have the `sharding_key` parameter configured (except if there is only one shard).
 
+<Tip>
 For compatible `INSERT ... SELECT` queries between `Distributed` tables that use the same cluster, [`parallel_distributed_insert_select`](/reference/settings/session-settings/parallel#parallel_distributed_insert_select) can execute the query in parallel on each shard.
+</Tip>
 
 Each shard can have a `<weight>` defined in the config file. By default, the weight is `1`. Data is distributed across shards in the amount proportional to the shard weight. All shard weights are summed up, then each shard's weight is divided by the total to determine each shard's proportion. For example, if there are two shards and the first has a weight of 1 while the second has a weight of 2, the first will be sent one third (1 / 3) of inserted rows and the second will be sent two thirds (2 / 3).
 
