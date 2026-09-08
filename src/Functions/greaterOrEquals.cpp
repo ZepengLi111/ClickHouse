@@ -9,7 +9,7 @@ using FunctionGreaterOrEquals = FunctionComparison<GreaterOrEqualsOp, NameGreate
 using FunctionGreater = FunctionComparison<GreaterOp, NameGreater>;
 using FunctionEquals = FunctionComparison<EqualsOp, NameEquals>;
 
-/// Avoid second instantiation
+/// Instantiated in greater.cpp and equals.cpp.
 extern template class FunctionComparison<GreaterOp, NameGreater>;
 extern template class FunctionComparison<EqualsOp, NameEquals>;
 

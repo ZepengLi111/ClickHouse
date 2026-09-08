@@ -7,6 +7,11 @@
 namespace DB
 {
 
+/// Instantiated in isNotDistinctFrom.cpp.
+extern template class FunctionComparison<EqualsOp, NameEquals, true>;
+/// The null-safe comparison falls back to the plain one for tuples; instantiated in notEquals.cpp.
+extern template class FunctionComparison<NotEqualsOp, NameNotEquals>;
+
 REGISTER_FUNCTION(IsDistinctFrom)
 {
     FunctionDocumentation::Description description = R"(
