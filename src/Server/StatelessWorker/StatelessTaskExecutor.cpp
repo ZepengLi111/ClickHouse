@@ -8,10 +8,12 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageFactory.h>
 #include <Core/Block.h>
 #include <Common/Exception.h>
+#include <Common/FailPoint.h>
 #include <Common/SipHash.h>
 #include <Common/QueryScope.h>
 #include <Common/Stopwatch.h>
 #include <Common/logger_useful.h>
+#include <base/sleep.h>
 #include <exception>
 #include <mutex>
 
@@ -24,6 +26,11 @@ namespace CurrentMetrics
 
 namespace DB
 {
+
+namespace FailPoints
+{
+    extern const char distributed_plan_delay_root_cause_report[];
+}
 
 /// TODO: move
 std::pair<ObjectStoragePtr, String> getObjectStorageForTemporaryFiles(const String & unique_temp_file_path, ContextPtr context);
@@ -140,7 +147,14 @@ StatelessTaskExecutor::Result StatelessTaskExecutor::startTask(const String & un
         {
             tryLogCurrentException(getLogger("StatelessTaskExecutor"),
                 fmt::format("Task {} failed", task_description.task.task_id));
-            task_promise->set_value(currentTaskFailure());
+            auto failure = currentTaskFailure();
+            /// Lets the failures this one causes in the connected tasks reach the initiator first.
+            fiu_do_on(FailPoints::distributed_plan_delay_root_cause_report,
+            {
+                if (!DistributedQueryCancellation::isConsequence(failure.code))
+                    sleepForMilliseconds(1000);
+            });
+            task_promise->set_value(std::move(failure));
         }
     };
 

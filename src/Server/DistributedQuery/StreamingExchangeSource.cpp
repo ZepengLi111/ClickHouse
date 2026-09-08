@@ -8,6 +8,7 @@
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 #include <IO/WriteBufferFromString.h>
+#include <QueryPipeline/DistributedPlanExecutor.h>
 #include <Poco/Net/NetException.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
@@ -269,6 +270,33 @@ std::optional<Chunk> StreamingExchangeSource::tryGenerate()
     /// Drain the wakeup pipe; otherwise it would stay readable and wake the source again at once.
     output_update_wakeup.drain();
 
+    try
+    {
+        return readChunk();
+    }
+    catch (const Exception & e)
+    {
+        if (!cancellation || e.code() != ErrorCodes::EXCHANGE_PEER_DISCONNECTED)
+            throw;
+
+        /// The producer went away, most likely because the query is failing elsewhere. The driving
+        /// source learns why from the task statuses and reports it after the teardown, so record the
+        /// lost peer and end this stream instead of racing that report; the pipeline cannot finish
+        /// before the driving source. Once it is done nobody else reports: throw the record here.
+        const bool reported_by_driving_source = cancellation->recordCurrentException();
+        if (!reported_by_driving_source && !cancellation->isCancelledByPipeline())
+        {
+            cancellation->rethrowIfFailed();
+            throw;
+        }
+        LOG_TRACE(log, "Exchange stream {} lost its peer, leaving the report to the query: {}", stream_name, e.message());
+        finished_reading = true;
+        return std::nullopt;
+    }
+}
+
+std::optional<Chunk> StreamingExchangeSource::readChunk()
+{
     if (!was_on_start_called)
     {
         was_on_start_called = true;
