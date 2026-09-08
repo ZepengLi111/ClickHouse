@@ -9069,8 +9069,7 @@ Default age threshold in seconds for orphan file removal in Iceberg tables. File
 Allow to execute experimental Iceberg command `ALTER TABLE ... EXECUTE expire_snapshots`.
 )", EXPERIMENTAL) \
     DECLARE(Bool, write_full_path_in_iceberg_metadata, false, R"(
-Write fully qualified URIs into Iceberg metadata files instead of storage-relative paths, so external readers can resolve them: `s3://bucket/key`, or `file:///path` for an absolute local path.
-Only applied when the table is created; existing tables keep the form their metadata already declares.
+Write full paths (including s3://) into iceberg metadata files.
 )", EXPERIMENTAL) \
     DECLARE(String, iceberg_metadata_compression_method, "", R"(
 Method to compress `.metadata.json` file.
