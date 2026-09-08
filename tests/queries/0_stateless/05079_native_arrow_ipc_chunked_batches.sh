@@ -123,11 +123,9 @@ write("replacement", dictionary_schema, [
 ], formats=("ArrowStream",))
 PYEOF
 
-read_query()
+write_query()
 {
-    ${CLICKHOUSE_LOCAL} --path "${TMP_DIR}/local" --max_threads=1 --max_block_size="${BLOCK_SIZE}" \
-        --allow_experimental_nullable_tuple_type=0 --input_format_null_as_default=1 \
-        --query "$1"
+    printf '%s;\n' "$1"
 }
 
 COMPLEX_TYPES='s Tuple(a Nullable(Int64), b Array(Nullable(Int8))), f Array(Nullable(Int64))'
@@ -137,8 +135,9 @@ DICTIONARY_TYPES="n Nullable(UInt8), ${COMPLEX_TYPES}, d Int64"
 
 for FORMAT in Arrow ArrowStream; do
     for BLOCK_SIZE in 2 3; do
-        echo "${FORMAT} max_block_size=${BLOCK_SIZE}"
-        read_query "
+        echo "SET max_block_size=${BLOCK_SIZE};"
+        echo "SELECT '${FORMAT} max_block_size=${BLOCK_SIZE}';"
+        write_query "
             SELECT count(), sum(id), countIf(isNull(n)), countIf(isNull(s.a)), sum(length(s.b)),
                    sum(length(f)), sum(v), sum(t.a), sum(t.extra), sum(missing), countIf(toString(e) = '()'), max(bs)
             FROM
@@ -146,7 +145,7 @@ for FORMAT in Arrow ArrowStream; do
                 SELECT *, blockSize() AS bs
                 FROM file('${TMP_DIR}/mixed.${FORMAT}', '${FORMAT}', '${MIXED_TYPES}')
             )"
-        read_query "
+        write_query "
             SELECT count(), countIf(isNull(n)), countIf(isNull(s.a)), sum(length(s.b)),
                    sum(length(f)), countIf(toString(e) = '()'), max(bs)
             FROM
@@ -154,7 +153,7 @@ for FORMAT in Arrow ArrowStream; do
                 SELECT *, blockSize() AS bs
                 FROM file('${TMP_DIR}/bufferless.${FORMAT}', '${FORMAT}', '${ROOT_TYPES}')
             )"
-        read_query "
+        write_query "
             SELECT count(), countIf(isNull(s)), sum(length(tupleElement(assumeNotNull(s), 'b'))), max(bs)
             FROM
             (
@@ -163,7 +162,7 @@ for FORMAT in Arrow ArrowStream; do
                     's Nullable(Tuple(a Nullable(Int64), b Array(Nullable(Int8))))')
             )
             SETTINGS allow_experimental_nullable_tuple_type=1"
-        read_query "
+        write_query "
             SELECT count(), countIf(isNull(s.a)), sum(length(s.b)), sum(length(f)), max(bs)
             FROM
             (
@@ -175,7 +174,7 @@ for FORMAT in Arrow ArrowStream; do
             if [[ "$CASE" == replacement && "$FORMAT" == Arrow ]]; then
                 continue
             fi
-            read_query "
+            write_query "
                 SELECT count(), countIf(isNull(n)), countIf(isNull(s.a)), sum(length(s.b)),
                        sum(length(f)), sum(d), max(bs)
                 FROM
@@ -184,9 +183,13 @@ for FORMAT in Arrow ArrowStream; do
                     FROM file('${TMP_DIR}/${CASE}.${FORMAT}', '${FORMAT}', '${DICTIONARY_TYPES}')
                 )"
         done
-        read_query "
+        write_query "
             SELECT
                 (SELECT count() FROM file('${TMP_DIR}/mixed.${FORMAT}', '${FORMAT}', '${MIXED_TYPES}')),
                 (SELECT count() FROM file('${TMP_DIR}/empty.${FORMAT}', '${FORMAT}', '${MIXED_TYPES}'))"
     done
-done
+done > "$TMP_DIR/queries.sql"
+
+${CLICKHOUSE_LOCAL} --path "$TMP_DIR/local" --max_threads=1 \
+    --allow_experimental_nullable_tuple_type=0 --input_format_null_as_default=1 \
+    --multiquery --queries-file "$TMP_DIR/queries.sql"

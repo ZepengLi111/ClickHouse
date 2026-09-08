@@ -133,6 +133,9 @@ projection = pa.record_batch([
     columns["int32"],
 ], names=["run_end", "list_view", "interval", "keep"])
 
+queries = []
+checks = []
+
 for fmt, writer in (("Arrow", ipc.new_file), ("ArrowStream", ipc.new_stream)):
     for codec in (None, "lz4", "zstd"):
         name = codec or "uncompressed"
@@ -142,23 +145,28 @@ for fmt, writer in (("Arrow", ipc.new_file), ("ArrowStream", ipc.new_stream)):
             with writer(path, data.schema, options=ipc.IpcWriteOptions(compression=codec)) as stream:
                 stream.write_batch(data)
             paths.append(path)
-        queries = "\n".join(
+        queries.extend(
             f"SELECT * FROM file('{path}', '{fmt}', {{structure:String}}) FORMAT JSONEachRow;" for path in paths)
-        result = subprocess.run(
-            local + [f"--param_structure={structure}", "--multiquery", "--query", queries],
-            text=True, capture_output=True)
-        assert result.returncode == 0, (fmt, name, result.returncode, result.stdout, result.stderr)
-        actual = [json.loads(line) for line in result.stdout.splitlines()]
-        assert actual == expected_rows, (fmt, name, actual, expected_rows)
-        print(f"{fmt} {name}: OK")
+        checks.append((f"{fmt} {name}: OK", expected_rows))
 
     # Unsupported unrequested fields are traversed without validating or decoding their value buffers.
     path = out / f"{fmt}_projection"
     with writer(path, projection.schema) as stream:
         stream.write_batch(projection)
-    query = f"SELECT keep FROM file('{path}', '{fmt}', 'keep Tuple(n Nullable(UInt8), v Int32)') FORMAT JSONEachRow"
-    result = subprocess.run(local + ["--query", query], text=True, capture_output=True)
-    assert result.returncode == 0, (fmt, "projection", result.returncode, result.stdout, result.stderr)
-    assert [json.loads(line)["keep"] for line in result.stdout.splitlines()] == expected["int32"], result.stdout
-    print(f"{fmt} projection: OK")
+    queries.append(
+        f"SELECT keep FROM file('{path}', '{fmt}', 'keep Tuple(n Nullable(UInt8), v Int32)') FORMAT JSONEachRow;")
+    checks.append((f"{fmt} projection: OK", [{"keep": row} for row in expected["int32"]]))
+
+result = subprocess.run(local + [
+    f"--param_structure={structure}", "--multiquery", "--query", "\n".join(queries),
+], text=True, capture_output=True)
+assert result.returncode == 0 and not result.stderr, (result.returncode, result.stderr)
+lines = result.stdout.splitlines()
+position = 0
+for name, expected_rows in checks:
+    actual = [json.loads(line) for line in lines[position:position + len(expected_rows)]]
+    assert actual == expected_rows, (name, actual, expected_rows)
+    position += len(expected_rows)
+    print(name)
+assert position == len(lines), lines[position:]
 PY

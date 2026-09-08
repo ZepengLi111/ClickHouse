@@ -23,6 +23,8 @@ out = sys.argv[1]
 local = shlex.split(os.environ["CLICKHOUSE_LOCAL"]) + [
     "--path", f"{out}/local", "--max_threads=1", "--max_block_size=3",
 ]
+queries = []
+expected = []
 rows = 257
 batch = pa.record_batch([pa.nulls(rows)], names=["n"])
 
@@ -33,15 +35,17 @@ for fmt, writer_type in (("Arrow", ipc.new_file), ("ArrowStream", ipc.new_stream
     with writer_type(path, batch.schema) as writer:
         writer.write_batch(batch)
     source = f"file('{path}', '{fmt}', 'n Nullable(UInt8)')"
-    count = subprocess.run(local + ["--query", f"SELECT count() FROM {source}"], text=True, capture_output=True)
-    assert count.returncode == 0, count.stderr
-    assert count.stdout == f"{rows}\n", count.stdout
-    limited = subprocess.run(local + ["--query", f"SELECT n FROM {source} LIMIT 7"], text=True, capture_output=True)
-    assert limited.returncode == 0, limited.stderr
-    assert limited.stdout == "\\N\n" * 7, limited.stdout
-    bounded = subprocess.run(local + [
-        "--max_result_rows=20", "--result_overflow_mode=throw", "--query", f"SELECT n FROM {source}",
-    ], text=True, capture_output=True)
-    assert bounded.returncode != 0 and "TOO_MANY_ROWS" in bounded.stderr, (bounded.returncode, bounded.stdout, bounded.stderr)
+    queries.extend([
+        f"SELECT count() FROM {source};",
+        f"SELECT n FROM {source} LIMIT 7;",
+        f"SELECT n FROM {source} FORMAT Null SETTINGS max_result_rows=20, result_overflow_mode='throw'; "
+        "-- { serverError TOO_MANY_ROWS_OR_BYTES }",
+    ])
+    expected.extend([str(rows)] + ["\\N"] * 7)
+
+result = subprocess.run(local + ["--multiquery", "--query", "\n".join(queries)], text=True, capture_output=True)
+assert result.returncode == 0 and not result.stderr, (result.returncode, result.stderr)
+assert result.stdout.splitlines() == expected, result.stdout
+for fmt in ("Arrow", "ArrowStream"):
     print(f"OK {fmt}: count, LIMIT, max_result_rows")
 PY
