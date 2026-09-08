@@ -1317,16 +1317,22 @@ def find_master_build(commits, build_type):
 
 def local_master_track_commits(local_master_commits_to_check_for_build):
     """Master shas below the merge base for a local run, which has no `master_track_commits_sha` kv data."""
-    # resolving 'master' via upstream or origin as a fallback; added 'main' just in case
+    # Prefer an explicit upstream master ref, then fall back to origin.
     master_ref = next(
         (
             ref
             for ref in ("upstream/master", "upstream/main", "origin/master", "origin/main")
             if Shell.check(f"git rev-parse --verify --quiet {ref} > /dev/null")
         ),
-        "origin/master",
+        None,
     )
-    # resolving merge-base up front and fail loud (return []) instead of silently walking HEAD.
+    if master_ref is None:
+        print(
+            "WARNING: no upstream/origin master ref found; "
+            "skipping local master-track commits"
+        )
+        return []
+    # Resolve merge-base first so failures cannot make git log walk HEAD.
     merge_base = Shell.get_output(f"git merge-base HEAD {master_ref}").strip()
     if not merge_base:
         print(
@@ -1334,15 +1340,12 @@ def local_master_track_commits(local_master_commits_to_check_for_build):
             "skipping local master-track commits"
         )
         return []
-    # merge-base may sit off master's first-parent chain (branch cut from a merge's 2nd parent); anchor on the newest master-first-parent commit at/below it.
-    anchor = merge_base
-    if not Shell.check(
-        f"git rev-list --first-parent -n 1000 {master_ref} | grep -q ^{merge_base}"
-    ):
-        anchor = Shell.get_output(
-            f"git rev-list --first-parent -n 1000 {master_ref} | "
-            f"while read c; do git merge-base --is-ancestor $c {merge_base} && echo $c && break; done"
-        ).strip()
+    # Anchor on the newest master first-parent commit reachable from the merge-base.
+    # `above` is the oldest newer commit; its first parent is the anchor.
+    above = Shell.get_output(
+        f"git rev-list --first-parent {master_ref} ^{merge_base} | tail -1"
+    ).strip()
+    anchor = Shell.get_output(f"git rev-parse {above}^").strip() if above else merge_base
     if not anchor:
         print(
             "WARNING: no master-side ancestor below the merge-base; "
@@ -1353,7 +1356,7 @@ def local_master_track_commits(local_master_commits_to_check_for_build):
         f"git log --first-parent --format=%H -n {local_master_commits_to_check_for_build} "
         f"{anchor}"
     ).split()
-    # Drop first commit on the branch
+    # Drop HEAD to avoid comparing a build with itself.
     head = Shell.get_output("git rev-parse HEAD").strip()
     if commits and commits[0] == head:
         commits.pop(0)
