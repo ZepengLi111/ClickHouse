@@ -4372,12 +4372,6 @@ bool KeyCondition::extractAtomFromTree(const RPNBuilderTreeNode & node, const Bu
                 return false;
             }
 
-            /// A `NaN` nested in a container is not foldable the way a scalar one is: equality and ordering
-            /// disagree per nesting path. It must not reach the key transformations below either, which map it
-            /// to an ordinary comparable value, so the range would answer a predicate other than the one asked.
-            if (fieldContainsNaN(const_value))
-                return false;
-
             bool condition_is_relaxed = false;
             bool constant_chain_is_positive = true;
 
