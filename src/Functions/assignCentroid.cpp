@@ -470,11 +470,11 @@ private:
     {
         auto dictionary = dict_helper.getDictionary(dict_name);
 
-        {
-            std::lock_guard lock(cache_mutex);
-            if (cached_matrix && cached_dict.lock() == dictionary)
-                return cached_matrix;
-        }
+        /// The lock is held across the read-and-build, not just the lookup.
+        std::lock_guard lock(cache_mutex);
+
+        if (cached_matrix && cached_dict.lock() == dictionary)
+            return cached_matrix;
 
         /// Full-read the dictionary (same mechanism the dictionary() table function uses).
         QueryPipeline pipeline(dictionary->read(Names{"cid", "vec"}, /*max_block_size=*/65536, /*num_streams=*/1));
@@ -546,11 +546,8 @@ private:
         auto matrix = std::make_shared<CentroidMatrix>();
         matrix->build(row_major.data(), k, dim, ids.data());
 
-        {
-            std::lock_guard lock(cache_mutex);
-            cached_matrix = matrix;
-            cached_dict = dictionary;
-        }
+        cached_matrix = matrix;
+        cached_dict = dictionary;
         return matrix;
     }
 };
