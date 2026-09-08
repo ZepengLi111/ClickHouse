@@ -1480,9 +1480,12 @@ ColumnPtr RecordBatchDecoder::decodeUnion(const ArrowField & field, size_t rows,
     auto & discr_data = local_discriminators->getData();
     auto & off_data = offsets->getData();
 
-    /// Sparse children are compacted to their selected values. Dense children can retain unused values
-    /// after slicing; compact them if their total exceeds the row count, as required by `ColumnVariant`.
-    const bool compact_children = !dense || invisible_rows || total_child_rows > rows;
+    /// `ColumnVariant` requires each element column to hold exactly the values of the rows selecting it.
+    /// Sparse children hold a value for every union row, dense children may retain unselected values after
+    /// slicing, and a selected null value becomes a `Variant` NULL that leaves the value unreferenced. In
+    /// all these cases the selected values are gathered into compact element columns.
+    const bool compact_children = !dense || invisible_rows || total_child_rows > rows
+        || std::ranges::any_of(child_states, [](const ChildState & state) { return state.null_map != nullptr; });
     MutableColumns compact;
     if (compact_children)
     {
