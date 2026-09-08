@@ -708,43 +708,17 @@ bool isDeterministicInScopeOfQuery(const ActionsDAG::Node * node)
     return true;
 }
 
-/// Convert a boolean-compatible node into a filter condition of exactly `result_type`. Requires
-/// node.result_type->canBeUsedInBooleanContext(). notEquals(x, 0) rather than a cast to UInt8, which
-/// would map 256 to 0 and turn a true condition false.
-static const ActionsDAG::Node & toBooleanFilterNode(
+/// `splitFilterNodeForAllowedInputs` owns no DAG: it collects new nodes in `additional_nodes`.
+static const ActionsDAG::Node & addBooleanCondition(
     const ActionsDAG::Node & node,
     const DataTypePtr & result_type,
     ActionsDAG::Nodes & additional_nodes,
     const ContextPtr & context)
 {
     ActionsDAG tmp_dag;
-    /// The zero literal keeps the outer type but takes its value from the unwrapped one: a Nullable
-    /// or LowCardinality(Nullable) default is NULL, and notEquals(x, NULL) is NULL, i.e. false for
-    /// every row. Nothing has no scalar default, so a bare NULL literal keeps the Nullable one.
-    auto nested_type = removeLowCardinalityAndNullable(node.result_type);
-    auto zero_field
-        = (nested_type->getTypeId() == TypeIndex::Nothing) ? node.result_type->getDefault() : nested_type->getDefault();
-    auto zero_column = node.result_type->createColumnConst(0, zero_field);
-    const auto & zero_node = tmp_dag.addColumn(std::move(zero_column), node.result_type, "0");
-    auto ne_func = FunctionFactory::instance().get("notEquals", context);
-    const auto * res = &tmp_dag.addFunction(ne_func, {&node, &zero_node}, {});
-
-    /// notEquals propagates nullability, but a caller that reuses a node typed UInt8 keeps its
-    /// already prepared function, which rejects a ColumnNullable at execution. ifNull rather than a
-    /// cast: casting a NULL to a non-Nullable type throws, and NULL already means false here.
-    if (isNullableOrLowCardinalityNullable(res->result_type) && !canContainNull(*result_type))
-    {
-        auto false_column = DataTypeUInt8().createColumnConst(0, Field(0));
-        const auto & false_node = tmp_dag.addColumn(std::move(false_column), std::make_shared<DataTypeUInt8>(), "0");
-        auto if_null_func = FunctionFactory::instance().get("ifNull", context);
-        res = &tmp_dag.addFunction(if_null_func, {res, &false_node}, {});
-    }
-
-    if (!res->result_type->equals(*result_type))
-        res = &tmp_dag.addCast(*res, result_type, {}, context);
-
+    const auto & res = tmp_dag.addBooleanCondition(node, result_type, context);
     additional_nodes.splice(additional_nodes.end(), ActionsDAG::detachNodes(std::move(tmp_dag)));
-    return *res;
+    return res;
 }
 
 static const ActionsDAG::Node * splitFilterNodeForAllowedInputs(
@@ -776,7 +750,7 @@ static const ActionsDAG::Node * splitFilterNodeForAllowedInputs(
                 /// Expression like (not_allowed AND 256) can't be reduced to (and(256)) because AND requires
                 /// at least two arguments; also it can't be reduced to (256) because result type is different.
                 if (!res->result_type->equals(*node->result_type))
-                    res = &toBooleanFilterNode(*res, node->result_type, additional_nodes, context);
+                    res = &addBooleanCondition(*res, node->result_type, additional_nodes, context);
 
                 return res;
             }
@@ -803,10 +777,12 @@ static const ActionsDAG::Node * splitFilterNodeForAllowedInputs(
                     /// An atom whose type has no boolean interpretation is dropped, so the hint
                     /// contributes no filter rather than throwing or inventing a truth value.
                     for (const auto & output : index_hint_dag.getOutputs())
-                        if (const auto * child_copy = splitFilterNodeForAllowedInputs(
-                                output, allowed_inputs, additional_nodes, context, allow_partial_result);
-                            child_copy && child_copy->result_type->canBeUsedInBooleanContext())
+                    {
+                        const auto * child_copy
+                            = splitFilterNodeForAllowedInputs(output, allowed_inputs, additional_nodes, context, allow_partial_result);
+                        if (child_copy && child_copy->result_type->canBeUsedInBooleanContext())
                             atoms.push_back(child_copy);
+                    }
 
                     if (!atoms.empty())
                     {
@@ -822,7 +798,7 @@ static const ActionsDAG::Node * splitFilterNodeForAllowedInputs(
                         additional_nodes.splice(additional_nodes.end(), ActionsDAG::detachNodes(std::move(index_hint_dag)));
 
                         if (!res->result_type->equals(*node->result_type))
-                            res = &toBooleanFilterNode(*res, node->result_type, additional_nodes, context);
+                            res = &addBooleanCondition(*res, node->result_type, additional_nodes, context);
 
                         return res;
                     }

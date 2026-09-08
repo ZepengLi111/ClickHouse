@@ -794,6 +794,16 @@ const ActionsDAG::Node * MergeTreeIndexConditionSet::operatorFromDAG(const Actio
     return nullptr;
 }
 
+/// The truth value of a constant used as a condition. A type with no boolean reading (`String`, a
+/// wide integer) only reaches a condition position inside `indexHint`, which never evaluates its
+/// arguments, so it states nothing: `getBool` would throw on a `String` and read 256 as false.
+static std::optional<bool> tryGetConstantCondition(const ActionsDAG::Node & node)
+{
+    if (!node.column || !node.result_type->canBeUsedInBooleanContext())
+        return {};
+    return node.column->getBool(0);
+}
+
 bool MergeTreeIndexConditionSet::checkDAGUseless(const ActionsDAG::Node & node, const ContextPtr & context, std::vector<FutureSetPtr> & sets_to_prepare, bool atomic) const
 {
     const auto * node_to_check = &node;
@@ -811,7 +821,7 @@ bool MergeTreeIndexConditionSet::checkDAGUseless(const ActionsDAG::Node & node, 
     }
     if (node.column)
     {
-        return !atomic && node.column->getBool(0);
+        return !atomic && tryGetConstantCondition(node).value_or(true);
     }
     if (node.type == ActionsDAG::ActionType::FUNCTION)
     {
@@ -829,12 +839,10 @@ bool MergeTreeIndexConditionSet::checkDAGUseless(const ActionsDAG::Node & node, 
             bool all_useless = true;
             for (const auto & arg : arguments)
             {
-                /// For OR, skip constant false children — they are identity elements
-                /// of OR and don't affect filtering. Without this, the constant
-                /// check above returns false (not useless) for `getBool(0) == 0`,
-                /// which would incorrectly make the entire OR appear non-useless
-                /// even when no indexed columns are referenced.
-                if (function_name == "or" && arg->column && !arg->column->getBool(0))
+                /// A constant false child of an OR is its identity element and does not affect
+                /// filtering, but the constant check above reports it as not useless, which would
+                /// make the whole OR look non-useless even with no indexed column in it.
+                if (function_name == "or" && tryGetConstantCondition(*arg) == false)
                     continue;
 
                 bool u = checkDAGUseless(*arg, context, sets_to_prepare, atomic);
