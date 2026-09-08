@@ -28,5 +28,21 @@ INSERT INTO t_ngram_backslash VALUES ('xxab\\cdyy'), ('other1'), ('other2'), ('o
 
 SELECT count() FROM t_ngram_backslash WHERE s LIKE '%ab\\\\%cd%' SETTINGS use_skip_indexes = 0;
 SELECT count() FROM t_ngram_backslash WHERE s LIKE '%ab\\\\%cd%';
+SELECT count() FROM t_ngram_backslash WHERE s LIKE '%ab\\\\%cd%' SETTINGS force_data_skipping_indices = 'i';
 
 DROP TABLE t_ngram_backslash;
+
+-- The same tokenizer answers the `LIKE` fallback of a text index with the `ngrams` tokenizer.
+
+DROP TABLE IF EXISTS t_text_index_backslash;
+
+CREATE TABLE t_text_index_backslash (s String, INDEX i s TYPE text(tokenizer = ngrams(2)) GRANULARITY 1)
+ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 2;
+
+INSERT INTO t_text_index_backslash VALUES ('xxab\\\\cdyy'), ('other1'), ('other2'), ('other3');
+
+SELECT count() FROM t_text_index_backslash WHERE s LIKE '%ab\\\\\\\\%cd%' SETTINGS use_skip_indexes = 0;
+SELECT count() FROM t_text_index_backslash WHERE s LIKE '%ab\\\\\\\\%cd%'
+SETTINGS use_text_index_like_evaluation_by_dictionary_scan = 0;
+
+DROP TABLE t_text_index_backslash;
