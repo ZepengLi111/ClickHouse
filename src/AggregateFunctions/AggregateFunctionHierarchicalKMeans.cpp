@@ -868,7 +868,7 @@ struct HierarchicalKMeansData
         if (other.seen <= cap)
         {
             for (UInt64 slot = 0; slot < have_theirs; ++slot)
-                addVector(&other.samples[slot * dim], static_cast<UInt32>(dim), cap);
+                addVector(&other.samples[slot * dim], dim, cap);
             return;
         }
 
@@ -882,7 +882,7 @@ struct HierarchicalKMeansData
             seen = other.seen;
             rng = other.rng;
             for (UInt64 slot = 0; slot < have_ours; ++slot)
-                addVector(&ours[slot * dim], static_cast<UInt32>(dim), cap);
+                addVector(&ours[slot * dim], dim, cap);
             return;
         }
 
