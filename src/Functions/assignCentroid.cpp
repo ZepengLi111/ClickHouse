@@ -56,84 +56,83 @@ namespace AssignCentroidImpl
 namespace
 {
 
-/// Register-blocking shape: 6 x 16 accumulators is 12 YMM registers on AVX2 (of 16), leaving the rest for
-/// operands. They must stay in registers - an L1-resident accumulator costs a load and a store per FMA.
-/// See https://en.wikipedia.org/wiki/Loop_nest_optimization
+/// The register-blocking shape of `scoreTile`. 6 x 16 accumulators fill 12 of the 16 AVX2 vector registers
+/// and leave the rest for operands, so the accumulators stay in registers rather than in L1, where each
+/// multiply-add would cost a load and a store.
 constexpr size_t ROW_BLOCK = 6;
 constexpr size_t COL_BLOCK = 16;
 
 DECLARE_MULTITARGET_CODE(
 
-/// Score n rows against ONE packed tile of width centroids, keeping the running best score/id per row.
-/// First check build() and assignBlock() to understand how the initial preparation is done.
+/// Score every row against one tile of centroids, keeping the running best score and id per row.
+/// See `build` and `assignBlock` for how the tile is prepared.
 ///
-/// A blocked GEMM rather than a sequence of GEMVs: scoring one row at a time re-reads the whole centroid tile
-/// per vector, which at 32768 x 768 (~100 MB) is bandwidth-bound; blocking ROW_BLOCK rows cut it 3.5x.
-/// See https://en.wikipedia.org/wiki/Matrix_multiplication_algorithm (the cache-blocked algorithm), or
-/// Goto & van de Geijn, "Anatomy of High-Performance Matrix Multiplication", ACM TOMS 34(3), 2008, which is
-/// where this microkernel shape comes from.
+/// Rows are handled ROW_BLOCK at a time rather than one at a time: scoring a single row re-reads the whole
+/// tile, which is bandwidth-bound at realistic sizes, while a block of rows reuses each tile value
+/// ROW_BLOCK times. Measured 3.5x at 32768 centroids of dimension 768. The blocking shape follows
+/// Goto & van de Geijn, "Anatomy of High-Performance Matrix Multiplication", ACM TOMS 34(3), 2008.
 void scoreTile(
-    const Float32 * __restrict vec_data, size_t n, size_t dim,
-    const Float32 * __restrict pack, const Float32 * __restrict cnorm_tile, const UInt32 * __restrict ids_tile,
-    size_t width, Float32 * __restrict best_score, UInt32 * __restrict res)
+    const Float32 * __restrict vec_data, size_t num_rows, size_t dim,
+    const Float32 * __restrict tile_centroids, const Float32 * __restrict tile_sq_norms, const UInt32 * __restrict tile_ids,
+    size_t width, Float32 * __restrict best_score, UInt32 * __restrict result_ids)
 {
-    /// Compute the score for this row and update best so far
-    auto reduce_row = [&](size_t row, const Float32 * __restrict a, size_t c0, size_t count)
+    /// Score this row against `count` centroids and keep the best seen so far.
+    auto reduce_row = [&](size_t row, const Float32 * __restrict dots, size_t block_start, size_t count)
     {
-        Float32 bs = best_score[row];
-        UInt32 bid = res[row];
-        for (size_t c = 0; c < count; ++c)
+        Float32 best = best_score[row];
+        UInt32 best_id = result_ids[row];
+        for (size_t col = 0; col < count; ++col)
         {
-            const Float32 score = cnorm_tile[c0 + c] - 2.0f * a[c];
-            if (score < bs)
+            const Float32 score = tile_sq_norms[block_start + col] - 2.0f * dots[col];
+            if (score < best)
             {
-                bs = score;
-                bid = ids_tile[c0 + c];
+                best = score;
+                best_id = tile_ids[block_start + col];
             }
         }
-        best_score[row] = bs;
-        res[row] = bid;
+        best_score[row] = best;
+        result_ids[row] = best_id;
     };
 
     size_t row = 0;
-    for (; row + ROW_BLOCK <= n; row += ROW_BLOCK) /// 6 incoming vectors at a time
+    for (; row + ROW_BLOCK <= num_rows; row += ROW_BLOCK) /// ROW_BLOCK incoming vectors at a time
     {
-        for (size_t c0 = 0; c0 < width; c0 += COL_BLOCK) /// 16 centroids at a time
+        for (size_t block_start = 0; block_start < width; block_start += COL_BLOCK) /// COL_BLOCK centroids at a time
         {
-            Float32 acc[ROW_BLOCK][COL_BLOCK] = {};
+            Float32 dots[ROW_BLOCK][COL_BLOCK] = {};
 
-            for (size_t j = 0; j < dim; ++j) /// one per dimension
+            for (size_t coord = 0; coord < dim; ++coord) /// one per dimension
             {
-                const Float32 * __restrict col = pack + j * width + c0;
-                for (size_t r = 0; r < ROW_BLOCK; ++r)
+                const Float32 * __restrict column = tile_centroids + coord * width + block_start;
+                for (size_t block_row = 0; block_row < ROW_BLOCK; ++block_row)
                 {
-                    const Float32 xj = vec_data[(row + r) * dim + j];
-                    for (size_t c = 0; c < COL_BLOCK; ++c)
-                        acc[r][c] += xj * col[c];
+                    const Float32 coord_value = vec_data[(row + block_row) * dim + coord];
+                    for (size_t col = 0; col < COL_BLOCK; ++col)
+                        dots[block_row][col] += coord_value * column[col];
                 }
             }
 
-            for (size_t r = 0; r < ROW_BLOCK; ++r)
-                reduce_row(row + r, acc[r], c0, COL_BLOCK);
+            for (size_t block_row = 0; block_row < ROW_BLOCK; ++block_row)
+                reduce_row(row + block_row, dots[block_row], block_start, COL_BLOCK);
         }
     }
 
-    /// Tail rows that do not fill a block.
-    for (; row < n; ++row)
+    /// Tail rows that do not fill a whole block.
+    for (; row < num_rows; ++row)
     {
-        for (size_t c0 = 0; c0 < width; c0 += COL_BLOCK)
+        for (size_t block_start = 0; block_start < width; block_start += COL_BLOCK)
         {
-            Float32 acc[COL_BLOCK] = {};
+            Float32 dots[COL_BLOCK] = {};
 
-            for (size_t j = 0; j < dim; ++j)
+            for (size_t coord = 0; coord < dim; ++coord)
             {
-                const Float32 xj = vec_data[row * dim + j];
-                const Float32 * __restrict col = pack + j * width + c0;
-                for (size_t c = 0; c < COL_BLOCK; ++c)
-                    acc[c] += xj * col[c];
+                const Float32 coord_value = vec_data[row * dim + coord];
+                const Float32 * __restrict column = tile_centroids + coord * width + block_start;
+                for (size_t col = 0; col < COL_BLOCK; ++col)
+                    dots[col] += coord_value * column[col];
             }
 
-            reduce_row(row, acc, c0, COL_BLOCK);
+            reduce_row(row, dots, block_start, COL_BLOCK);
         }
     }
 }
@@ -145,23 +144,23 @@ void scoreTile(
 /// SIMD only, deliberately: executeImpl already runs on one pipeline thread per block, so threading here
 /// would only oversubscribe.
 void scoreTile(
-    const Float32 * vec_data, size_t n, size_t dim,
-    const Float32 * pack, const Float32 * cnorm_tile, const UInt32 * ids_tile,
-    size_t width, Float32 * best_score, UInt32 * res)
+    const Float32 * vec_data, size_t num_rows, size_t dim,
+    const Float32 * tile_centroids, const Float32 * tile_sq_norms, const UInt32 * tile_ids,
+    size_t width, Float32 * best_score, UInt32 * result_ids)
 {
 #if USE_MULTITARGET_CODE
     if (isArchSupported(TargetArch::x86_64_v4))
     {
-        TargetSpecific::x86_64_v4::scoreTile(vec_data, n, dim, pack, cnorm_tile, ids_tile, width, best_score, res);
+        TargetSpecific::x86_64_v4::scoreTile(vec_data, num_rows, dim, tile_centroids, tile_sq_norms, tile_ids, width, best_score, result_ids);
         return;
     }
     if (isArchSupported(TargetArch::x86_64_v3))
     {
-        TargetSpecific::x86_64_v3::scoreTile(vec_data, n, dim, pack, cnorm_tile, ids_tile, width, best_score, res);
+        TargetSpecific::x86_64_v3::scoreTile(vec_data, num_rows, dim, tile_centroids, tile_sq_norms, tile_ids, width, best_score, result_ids);
         return;
     }
 #endif
-    TargetSpecific::Default::scoreTile(vec_data, n, dim, pack, cnorm_tile, ids_tile, width, best_score, res);
+    TargetSpecific::Default::scoreTile(vec_data, num_rows, dim, tile_centroids, tile_sq_norms, tile_ids, width, best_score, result_ids);
 }
 
 }
@@ -170,11 +169,10 @@ void scoreTile(
 namespace
 {
 
-/// Coordinates are squared and summed in Float32, so a finite but very large value can still overflow the
-/// accumulator to infinity, making `score = cnorm - 2 * dot` a NaN. No `score < best` comparison is then
-/// true and the row silently takes the fallback id. Bounding `|x|` by `sqrt(FLT_MAX / (4 * dim))` keeps the
-/// sum of squares, the dot product and their difference finite. At dim = 768 that is ~3.3e17, far above any
-/// real embedding, so this rejects only input the kernel could not have scored correctly anyway.
+/// The largest coordinate the Float32 scoring math can still handle. Squares are summed in Float32, so a
+/// finite but huge coordinate overflows to infinity, the score becomes NaN, no comparison against the
+/// running best is true, and the row silently takes the fallback id. `sqrt(FLT_MAX / (4 * dim))` keeps the
+/// sum of squares and the dot product finite. At dim = 768 that is ~3.3e17, far above any real embedding.
 Float32 coordinateLimit(size_t dim)
 {
     return static_cast<Float32>(
@@ -184,84 +182,82 @@ Float32 coordinateLimit(size_t dim)
 /// Column-major centroids + squared norms + the id to return per centroid.
 struct CentroidMatrix
 {
-    size_t k = 0;
+    size_t num_centroids = 0;
     size_t dim = 0;
 
-    /// ct is the k centroids laid out in column-major form : ct[j * k + c] = coordinate j of centroid c
-    VectorWithMemoryTracking<Float32> ct;
+    /// Column-major: `centroids_transposed[coord * num_centroids + c]` is coordinate `coord` of centroid `c`.
+    VectorWithMemoryTracking<Float32> centroids_transposed;
 
-    VectorWithMemoryTracking<Float32> cnorm;   /// ||c||^2 - squared norm of the k centroids
-    VectorWithMemoryTracking<UInt32> ids;      /// cluster id returned when centroid c is nearest
+    VectorWithMemoryTracking<Float32> centroid_sq_norms;   /// the squared norm of each centroid
+    VectorWithMemoryTracking<UInt32> ids;                  /// the id to return when that centroid is nearest
 
-    /// Packs the centroids into the layout the kernel reads. `rows` is row-major (k * dim); `id_values` gives
-    /// the id per centroid, or null for 0..k-1. Runs once per block for the inline form and once per
-    /// dictionary version for the cached dictionary form - never per row.
+    /// Pack the centroids into the layout the kernel reads. `id_values` gives the id per centroid, or null
+    /// to use 0..num_centroids-1. Runs once per block for the inline form, and once per dictionary version
+    /// for the dictionary form - never per row.
     ///
-    /// For k = 3 centroids of dim = 2, rows = [[1,2], [3,4], [5,6]]:
+    /// For three centroids of dimension 2, `row_major` = [[1,2], [3,4], [5,6]]:
     ///
-    ///     ct    = [1, 3, 5,  2, 4, 6]   coordinate 0 of every centroid, then coordinate 1
-    ///     cnorm = [5, 25, 61]           1*1+2*2, 3*3+4*4, 5*5+6*6
-    ///     ids   = [0, 1, 2]             or the dictionary cids when id_values is given
-    void build(const Float32 * rows, size_t k_, size_t dim_, const UInt32 * id_values)
+    ///     centroids_transposed = [1, 3, 5,  2, 4, 6]   coordinate 0 of every centroid, then coordinate 1
+    ///     centroid_sq_norms    = [5, 25, 61]           1*1+2*2, 3*3+4*4, 5*5+6*6
+    ///     ids                  = [0, 1, 2]             or the dictionary cids when id_values is given
+    void build(const Float32 * row_major, size_t num_centroids_, size_t dim_, const UInt32 * id_values)
     {
-        k = k_;
+        num_centroids = num_centroids_;
         dim = dim_;
-        ct.assign(dim * k, 0.0f);
-        cnorm.assign(k, 0.0f);
-        ids.resize(k);
+        centroids_transposed.assign(dim * num_centroids, 0.0f);
+        centroid_sq_norms.assign(num_centroids, 0.0f);
+        ids.resize(num_centroids);
         const Float32 limit = coordinateLimit(dim);
-        for (size_t c = 0; c < k; ++c)
+        for (size_t centroid_index = 0; centroid_index < num_centroids; ++centroid_index)
         {
-            const Float32 * cen = rows + c * dim;
-            double s = 0;
-            for (size_t j = 0; j < dim; ++j)
+            const Float32 * centroid = row_major + centroid_index * dim;
+            double sq_norm = 0;
+            for (size_t coord = 0; coord < dim; ++coord)
             {
                 /// A centroid the kernel cannot score is silently unreachable rather than an error, so both
                 /// checks belong here. Free: this loop already reads every coordinate to build the norm.
-                if (!std::isfinite(cen[j]))
+                if (!std::isfinite(centroid[coord]))
                     throw Exception(ErrorCodes::INCORRECT_DATA,
-                        "assignCentroid: centroid {} must not contain non-finite values (NaN or Inf)", c);
-                if (std::abs(cen[j]) > limit)
+                        "assignCentroid: centroid {} must not contain non-finite values (NaN or Inf)", centroid_index);
+                if (std::abs(centroid[coord]) > limit)
                     throw Exception(ErrorCodes::INCORRECT_DATA,
                         "assignCentroid: centroid {} has coordinate {}, above the largest magnitude the "
-                        "Float32 scoring math can represent for dimension {} ({})", c, cen[j], dim, limit);
-                ct[j * k + c] = cen[j];
-                s += static_cast<double>(cen[j]) * static_cast<double>(cen[j]);
+                        "Float32 scoring math can represent for dimension {} ({})", centroid_index, centroid[coord], dim, limit);
+                centroids_transposed[coord * num_centroids + centroid_index] = centroid[coord];
+                sq_norm += static_cast<double>(centroid[coord]) * static_cast<double>(centroid[coord]);
             }
-            cnorm[c] = static_cast<Float32>(s);
-            ids[c] = id_values ? id_values[c] : static_cast<UInt32>(c);
+            centroid_sq_norms[centroid_index] = static_cast<Float32>(sq_norm);
+            ids[centroid_index] = id_values ? id_values[centroid_index] : static_cast<UInt32>(centroid_index);
         }
     }
 
-    /// Assign every vector in a block to its nearest-centroid id, writing ids into res (already sized n).
-    /// Worked example : a block has three rows: [[1,2], [3,4,5], [6]]. ClickHouse stores:
-    /// vec_data = [1, 2, 3, 4, 5, 6]     ← every row's floats, concatenated
-    /// offsets  = [2, 5, 6]              ← where each row ENDS (exclusive)
-    /// vec_data is the flat float buffer for the whole block — all rows vectors laid end to end
-    /// offsets is one number per row: the end position of that row's slice.
-    void assignBlock(const Float32 * vec_data, const ColumnArray::Offsets & offsets, size_t n, PaddedPODArray<UInt32> & res) const
+    /// Assign every vector in a block to its nearest centroid id, writing into `result_ids` (already sized).
+    ///
+    /// The block arrives in ClickHouse's array layout. For three rows [[1,2], [3,4,5], [6]]:
+    ///     vec_data = [1, 2, 3, 4, 5, 6]   every row's floats, concatenated
+    ///     offsets  = [2, 5, 6]            where each row ends, exclusive
+    void assignBlock(const Float32 * vec_data, const ColumnArray::Offsets & offsets, size_t num_rows, PaddedPODArray<UInt32> & result_ids) const
     {
-        /// Both builders reject an empty or zero-dimension centroid set, so either being zero here is a
-        /// programming error rather than bad input. Stated explicitly because it is a real precondition -
-        /// `dim` divides the tile size below - and because it does not survive the call boundary otherwise.
-        if (k == 0 || dim == 0)
+        /// Both builders reject an empty or zero-dimension centroid set, so reaching here with either at
+        /// zero is a bug, not bad input. `dim` divides the tile size below.
+        if (num_centroids == 0 || dim == 0)
             throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "assignCentroid: centroid matrix is empty (k = {}, dim = {})", k, dim);
+                "assignCentroid: centroid matrix is empty (num_centroids = {}, dim = {})", num_centroids, dim);
 
-        for (size_t row = 0; row < n; ++row) /// validate dimensions up front - the hot loop in GEMM needs that
+        for (size_t row = 0; row < num_rows; ++row) /// checked up front: the scoring loop assumes dense rows
         {
             size_t start = row ? offsets[row - 1] : 0;
-            size_t len = offsets[row] - start;
-            if (len != dim)
+            size_t length = offsets[row] - start;
+            if (length != dim)
                 throw Exception(ErrorCodes::SIZES_OF_ARRAYS_DONT_MATCH,
-                    "assignCentroid: input vector has {} dimensions but centroids have {}", len, dim);
+                    "assignCentroid: input vector has {} dimensions but centroids have {}", length, dim);
         }
 
-        /// A NaN probe never satisfies `score < bs`, so it would fall through to the `ids[0]` fallback and
-        /// return a plausible-looking id instead of failing. Swept linearly - the check above has established
-        /// that the rows are dense, so the payload is exactly `n * dim` floats.
+        /// A NaN probe never beats the running best, so it would fall through to the `ids[0]` fallback and
+        /// return a plausible-looking id instead of failing. The check above established that the rows are
+        /// dense, so the payload is exactly `num_rows * dim` floats and can be swept linearly.
         const Float32 limit = coordinateLimit(dim);
-        for (size_t i = 0; i < n * dim; ++i)
+        for (size_t i = 0; i < num_rows * dim; ++i)
         {
             if (!std::isfinite(vec_data[i]))
                 throw Exception(ErrorCodes::INCORRECT_DATA,
@@ -272,55 +268,54 @@ struct CentroidMatrix
                     "math can represent for dimension {} ({})", vec_data[i], dim, limit);
         }
 
-        VectorWithMemoryTracking<Float32> best_score(n, std::numeric_limits<Float32>::max());
-        for (size_t row = 0; row < n; ++row)
-            res[row] = ids[0];
+        VectorWithMemoryTracking<Float32> best_score(num_rows, std::numeric_limits<Float32>::max());
+        for (size_t row = 0; row < num_rows; ++row)
+            result_ids[row] = ids[0];
 
-        /// Worked example to understand a TILE :
-        /// With k=32768 and dim=768, the full centroid matrix is 32768 × 768 × 4 B = 100 MB.
-        /// Every input vector must be compared against all of it. Sweep the whole 100 MB once
-        /// per vector and you're reading from DRAM the entire time.
-        /// So instead: grab 'tile' centroids, score all n rows against that slice, then move to
-        /// the next slice. The slice is small enough to live in L2 cache. Note the tile is about
-        /// L2 cache and ROW_BLOCK / COL_BLOCK in another routine is about registers.
+        /// Score against the centroids one tile at a time, where a tile is sized to stay in L2.
         ///
-        /// tile = 512 KB ÷ (768 × 4 B) = 170, rounded down to a multiple of 16 → 160 centroids per slice
+        /// At 32768 centroids of dimension 768 the whole matrix is 100 MB, and every input vector has to be
+        /// compared against all of it. Sweeping all 100 MB once per vector reads from DRAM throughout.
+        /// Taking a tile at a time and scoring every row against it keeps the centroids in cache instead.
+        /// (This tile is about L2; ROW_BLOCK and COL_BLOCK in `scoreTile` are about registers.)
+        ///
+        /// For dimension 768: 512 KB / (768 * 4 B) = 170, rounded down to a multiple of COL_BLOCK -> 160.
         static constexpr size_t L2_TILE_BYTES = 512 * 1024;
-        constexpr size_t CB = AssignCentroidImpl::COL_BLOCK;
+        constexpr size_t col_block = AssignCentroidImpl::COL_BLOCK;
         const size_t tile = std::clamp<size_t>(
-            (L2_TILE_BYTES / (dim * sizeof(Float32))) / CB * CB, CB, 1024);
+            (L2_TILE_BYTES / (dim * sizeof(Float32))) / col_block * col_block, col_block, 1024);
 
-        VectorWithMemoryTracking<Float32> pack(tile * dim);
-        VectorWithMemoryTracking<Float32> cnorm_tile(tile);
-        VectorWithMemoryTracking<UInt32> ids_tile(tile);
+        VectorWithMemoryTracking<Float32> tile_centroids(tile * dim);
+        VectorWithMemoryTracking<Float32> tile_sq_norms(tile);
+        VectorWithMemoryTracking<UInt32> tile_ids(tile);
 
         /// Note the tile increment. This loop will run for 32768/160 = 205 times for the example.
-        for (size_t c0 = 0; c0 < k; c0 += tile)
+        for (size_t tile_start = 0; tile_start < num_centroids; tile_start += tile)
         {
-            const size_t width = std::min(tile, k - c0);
-            const size_t padded = (width + CB - 1) / CB * CB;
+            const size_t width = std::min(tile, num_centroids - tile_start);
+            const size_t padded = (width + col_block - 1) / col_block * col_block;
 
-            for (size_t j = 0; j < dim; ++j)
+            for (size_t coord = 0; coord < dim; ++coord)
             {
-                Float32 * pack_row = pack.data() + j * padded;
+                Float32 * tile_row = tile_centroids.data() + coord * padded;
 
-                /// ct has been laid out in column major form in build(). We will copy
-                /// 160 floats (1 dimension of each of the 160 centroids in the tile)
-                std::copy(&ct[j * k + c0], &ct[j * k + c0] + width, pack_row);
+                /// `build` left the centroids column-major, so one coordinate of every centroid in the
+                /// tile is already contiguous.
+                std::copy(&centroids_transposed[coord * num_centroids + tile_start], &centroids_transposed[coord * num_centroids + tile_start] + width, tile_row);
 
-                std::fill(pack_row + width, pack_row + padded, 0.0f); /// if any padding
+                std::fill(tile_row + width, tile_row + padded, 0.0f); /// if any padding
             }
-            /// Lay out the squared-norms and ids also for tile
-            std::copy(&cnorm[c0], &cnorm[c0] + width, cnorm_tile.begin());
-            std::fill(cnorm_tile.begin() + width, cnorm_tile.begin() + padded, std::numeric_limits<Float32>::infinity());
-            std::copy(&ids[c0], &ids[c0] + width, ids_tile.begin());
-            std::fill(ids_tile.begin() + width, ids_tile.begin() + padded, 0u);
+            /// The squared norms and ids for the same tile.
+            std::copy(&centroid_sq_norms[tile_start], &centroid_sq_norms[tile_start] + width, tile_sq_norms.begin());
+            std::fill(tile_sq_norms.begin() + width, tile_sq_norms.begin() + padded, std::numeric_limits<Float32>::infinity());
+            std::copy(&ids[tile_start], &ids[tile_start] + width, tile_ids.begin());
+            std::fill(tile_ids.begin() + width, tile_ids.begin() + padded, 0u);
 
-            /// Example: if vec_data is an INSERT block of 1000 vectors, we will score the 1000
-            /// against 160 centroids in each iteration and keep track in best_score & res
+            /// Every row in the block is scored against this tile; `best_score` and `result_ids` carry the
+            /// running winner across tiles.
             AssignCentroidImpl::scoreTile(
-                vec_data, n, dim, pack.data(), cnorm_tile.data(), ids_tile.data(), padded,
-                best_score.data(), res.data());
+                vec_data, num_rows, dim, tile_centroids.data(), tile_sq_norms.data(), tile_ids.data(), padded,
+                best_score.data(), result_ids.data());
         }
     }
 };
@@ -437,31 +432,31 @@ private:
         if (!target->equals(*arg.type))
             casted = castColumn({casted, arg.type, arg.name}, target);
 
-        const auto & outer = assert_cast<const ColumnArray &>(*casted);                    /// one row = the k centroids
-        const auto & inner = assert_cast<const ColumnArray &>(outer.getData());            /// k inner arrays
-        const auto & values = assert_cast<const ColumnFloat32 &>(inner.getData()).getData();
+        const auto & outer_array = assert_cast<const ColumnArray &>(*casted);                    /// one row = the num_centroids centroids
+        const auto & inner_array = assert_cast<const ColumnArray &>(outer_array.getData());            /// num_centroids inner_array arrays
+        const auto & values = assert_cast<const ColumnFloat32 &>(inner_array.getData()).getData();
 
-        size_t k = outer.getOffsets()[0];
-        if (k == 0)
+        size_t num_centroids = outer_array.getOffsets()[0];
+        if (num_centroids == 0)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "assignCentroid: centroids array is empty");
 
-        size_t dim = inner.getOffsets()[0];
+        size_t dim = inner_array.getOffsets()[0];
         if (dim == 0)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "assignCentroid: centroids have zero dimension");
 
-        VectorWithMemoryTracking<Float32> row_major(k * dim);
-        for (size_t c = 0; c < k; ++c)
+        VectorWithMemoryTracking<Float32> row_major(num_centroids * dim);
+        for (size_t centroid_index = 0; centroid_index < num_centroids; ++centroid_index)
         {
-            size_t start = c ? inner.getOffsets()[c - 1] : 0;
-            size_t len = inner.getOffsets()[c] - start;
-            if (len != dim)
+            size_t start = centroid_index ? inner_array.getOffsets()[centroid_index - 1] : 0;
+            size_t length = inner_array.getOffsets()[centroid_index] - start;
+            if (length != dim)
                 throw Exception(ErrorCodes::SIZES_OF_ARRAYS_DONT_MATCH,
-                    "assignCentroid: centroid {} has {} dimensions, expected {}", c, len, dim);
-            std::copy(&values[start], &values[start + len], &row_major[c * dim]);
+                    "assignCentroid: centroid {} has {} dimensions, expected {}", centroid_index, length, dim);
+            std::copy(&values[start], &values[start + length], &row_major[centroid_index * dim]);
         }
 
         auto matrix = std::make_shared<CentroidMatrix>();
-        matrix->build(row_major.data(), k, dim, /*id_values=*/nullptr);
+        matrix->build(row_major.data(), num_centroids, dim, /*id_values=*/nullptr);
         return matrix;
     }
 
@@ -507,11 +502,11 @@ private:
             const auto & vec_arr = assert_cast<const ColumnArray &>(*vec_col.column);
             const auto & vec_vals = assert_cast<const ColumnFloat32 &>(vec_arr.getData()).getData();
             const auto & vec_off = vec_arr.getOffsets();
-            for (size_t i = 0; i < cid_col->size(); ++i)
+            for (size_t row = 0; row < cid_col->size(); ++row)
             {
-                size_t start = i ? vec_off[i - 1] : 0;
-                size_t len = vec_off[i] - start;
-                centroids.emplace_back(cid_col->getUInt(i), VectorWithMemoryTracking<Float32>(&vec_vals[start], &vec_vals[start + len]));
+                size_t start = row ? vec_off[row - 1] : 0;
+                size_t length = vec_off[row] - start;
+                centroids.emplace_back(cid_col->getUInt(row), VectorWithMemoryTracking<Float32>(&vec_vals[start], &vec_vals[start + length]));
             }
         }
 
@@ -520,31 +515,31 @@ private:
 
         std::sort(centroids.begin(), centroids.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
 
-        size_t k = centroids.size();
+        size_t num_centroids = centroids.size();
         size_t dim = centroids[0].second.size();
         if (dim == 0)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "assignCentroid: dictionary {} has zero-dimension centroids", dict_name);
 
-        VectorWithMemoryTracking<Float32> row_major(k * dim);
-        VectorWithMemoryTracking<UInt32> ids(k);
-        for (size_t c = 0; c < k; ++c)
+        VectorWithMemoryTracking<Float32> row_major(num_centroids * dim);
+        VectorWithMemoryTracking<UInt32> ids(num_centroids);
+        for (size_t centroid_index = 0; centroid_index < num_centroids; ++centroid_index)
         {
-            if (centroids[c].second.size() != dim)
+            if (centroids[centroid_index].second.size() != dim)
                 throw Exception(ErrorCodes::SIZES_OF_ARRAYS_DONT_MATCH,
                     "assignCentroid: dictionary {} centroid {} has {} dimensions, expected {}",
-                    dict_name, centroids[c].first, centroids[c].second.size(), dim);
-            std::copy(centroids[c].second.begin(), centroids[c].second.end(), &row_major[c * dim]);
+                    dict_name, centroids[centroid_index].first, centroids[centroid_index].second.size(), dim);
+            std::copy(centroids[centroid_index].second.begin(), centroids[centroid_index].second.end(), &row_major[centroid_index * dim]);
 
             /// The result type is exactly UInt32 - reject anything greater
-            if (centroids[c].first > std::numeric_limits<UInt32>::max())
+            if (centroids[centroid_index].first > std::numeric_limits<UInt32>::max())
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
                     "assignCentroid: dictionary {} has cid {} which exceeds the UInt32 range of the result",
-                    dict_name, centroids[c].first);
-            ids[c] = static_cast<UInt32>(centroids[c].first);
+                    dict_name, centroids[centroid_index].first);
+            ids[centroid_index] = static_cast<UInt32>(centroids[centroid_index].first);
         }
 
         auto matrix = std::make_shared<CentroidMatrix>();
-        matrix->build(row_major.data(), k, dim, ids.data());
+        matrix->build(row_major.data(), num_centroids, dim, ids.data());
 
         cached_matrix = matrix;
         cached_dict = dictionary;

@@ -15,7 +15,7 @@
 3	1
 -- deterministic for a given seed, and a different seed is allowed to differ
 1
--- spherical = 1 makes every centroid unit length
+-- cosine_distance = 1 makes every centroid unit length
 1	1
 -- degenerate input still terminates and returns k
 50

@@ -28,7 +28,7 @@
 #include <limits>
 #include <numeric>
 
-/// hierarchicalKMeans(k [, branching] [, max_iter] [, sample_cap] [, seed] [, spherical])(vec)
+/// hierarchicalKMeans(k [, branching] [, max_iter] [, sample_cap] [, seed] [, cosine_distance])(vec)
 ///
 /// Trains k centroids from the aggregated vectors and returns them as Array(Array(Float32)) - the coarse
 /// quantizer for a SQL-side IVF index. Keeps a bounded reservoir of sample_cap vectors, so memory is
@@ -98,11 +98,10 @@ namespace
 
 using Float = Float32;
 
-/// Coordinates are squared and summed in Float32, so a finite but very large value can still overflow the
-/// accumulator to infinity. Every `score < best` comparison then goes false and the point silently takes
-/// whatever id the loop started with. Bounding `|x|` by `sqrt(FLT_MAX / (4 * dim))` keeps the sum of squares,
-/// the dot product and `cnorm - 2 * dot` all finite. At dim = 768 the bound is ~3.3e17, far above any real
-/// embedding, so this rejects only input the kernels could not have scored correctly anyway.
+/// The largest coordinate the Float32 scoring math can still handle. Squares are summed in Float32, so a
+/// finite but huge coordinate overflows to infinity, every comparison against the running best goes false,
+/// and the point keeps whatever centroid the loop started with. `sqrt(FLT_MAX / (4 * dim))` keeps the sum of
+/// squares and the dot product finite. At dim = 768 that is ~3.3e17, far above any real embedding.
 Float coordinateLimit(size_t dim)
 {
     return static_cast<Float>(
@@ -111,91 +110,95 @@ Float coordinateLimit(size_t dim)
 
 DECLARE_MULTITARGET_CODE(
 
-/// For every point, `argmin_c (||c||^2 - 2 x.c)` - that is `argmin_c ||x - c||^2` with the constant `||x||^2`
-/// dropped. `ct` is column-major (`ct[j * k + c]`), so the inner loop walks `k` contiguous floats against a
-/// broadcast `x[j]` and the `k` accumulators stay in registers. In the tree `k == branching`, 16 by default.
+/// Assign every point to its nearest centroid.
+///
+/// Minimizing `||point - centroid||^2` is the same as minimizing `||centroid||^2 - 2 * dot(point, centroid)`,
+/// because `||point||^2` is the same for every candidate. That is why only the centroid norms are needed.
+///
+/// `centroids_transposed` is column-major, so the inner loop reads `num_centroids` contiguous floats and
+/// multiplies them by one broadcast coordinate of the point.
 void assignRows(
-    const Float * __restrict pts, size_t n, size_t d,
-    const Float * __restrict ct, const Float * __restrict cnorm, size_t k,
-    UInt32 * __restrict assign, Float * __restrict best_out)
+    const Float * __restrict points, size_t num_points, size_t dim,
+    const Float * __restrict centroids_transposed, const Float * __restrict centroid_sq_norms, size_t num_centroids,
+    UInt32 * __restrict assignment, Float * __restrict best_score_out)
 {
-    /// Fixed so `acc` is a stack array the compiler can keep in registers.
+    /// Fixed size so `dots` is a stack array the compiler can keep in registers.
     static constexpr size_t TILE = 32;
-    Float acc[TILE];
+    Float dots[TILE];
 
-    for (size_t i = 0; i < n; ++i)
+    for (size_t row = 0; row < num_points; ++row)
     {
-        const Float * __restrict x = pts + i * d;
+        const Float * __restrict point = points + row * dim;
         Float best = std::numeric_limits<Float>::max();
-        UInt32 best_c = 0;
+        UInt32 best_centroid = 0;
 
-        for (size_t c0 = 0; c0 < k; c0 += TILE)
+        for (size_t tile_start = 0; tile_start < num_centroids; tile_start += TILE)
         {
-            const size_t width = std::min(TILE, k - c0);
+            const size_t width = std::min(TILE, num_centroids - tile_start);
 
-            for (size_t c = 0; c < width; ++c)
-                acc[c] = 0.0f;
+            for (size_t col = 0; col < width; ++col)
+                dots[col] = 0.0f;
 
-            for (size_t j = 0; j < d; ++j)
+            for (size_t coord = 0; coord < dim; ++coord)
             {
-                const Float xj = x[j];
-                const Float * __restrict col = ct + j * k + c0;
-                for (size_t c = 0; c < width; ++c)
-                    acc[c] += xj * col[c];
+                const Float coord_value = point[coord];
+                const Float * __restrict column = centroids_transposed + coord * num_centroids + tile_start;
+                for (size_t col = 0; col < width; ++col)
+                    dots[col] += coord_value * column[col];
             }
 
-            for (size_t c = 0; c < width; ++c)
+            for (size_t col = 0; col < width; ++col)
             {
-                const Float score = cnorm[c0 + c] - 2.0f * acc[c];
+                const Float score = centroid_sq_norms[tile_start + col] - 2.0f * dots[col];
                 if (score < best)
                 {
                     best = score;
-                    best_c = static_cast<UInt32>(c0 + c);
+                    best_centroid = static_cast<UInt32>(tile_start + col);
                 }
             }
         }
 
-        assign[i] = best_c;
-        best_out[i] = best;
+        assignment[row] = best_centroid;
+        best_score_out[row] = best;
     }
 }
 
-/// `best_d2[i] = min(best_d2[i], ||x_i - cen||^2)` for the k-means++ seeding pass. Returns `sum(best_d2)`
-/// over the range, accumulated in double because it feeds the sampling threshold.
+/// Lower `best_sq_dist[row]` to the squared distance from that point to `centroid`, for the k-means++
+/// seeding pass. Returns the sum over the range, in double because it feeds the sampling threshold.
 double updateMinSqDist(
-    const Float * __restrict pts, size_t n, size_t d, const Float * __restrict cen, Float * __restrict best_d2)
+    const Float * __restrict points, size_t num_points, size_t dim, const Float * __restrict centroid, Float * __restrict best_sq_dist)
 {
     double total = 0;
-    for (size_t i = 0; i < n; ++i)
+    for (size_t row = 0; row < num_points; ++row)
     {
-        const Float * __restrict x = pts + i * d;
-        Float dd = 0.0f;
-        for (size_t j = 0; j < d; ++j)
+        const Float * __restrict point = points + row * dim;
+        Float sq_dist = 0.0f;
+        for (size_t coord = 0; coord < dim; ++coord)
         {
-            const Float t = x[j] - cen[j];
-            dd += t * t;
+            const Float diff = point[coord] - centroid[coord];
+            sq_dist += diff * diff;
         }
-        if (dd < best_d2[i])
-            best_d2[i] = dd;
-        total += static_cast<double>(best_d2[i]);
+        if (sq_dist < best_sq_dist[row])
+            best_sq_dist[row] = sq_dist;
+        total += static_cast<double>(best_sq_dist[row]);
     }
     return total;
 }
 
-/// `sums[c * d + j] += x_i[j]` and `++counts[c]` for the cluster each point was assigned to.
-/// `sums` stays double: it accumulates up to `n` values per coordinate, where float would drift.
+/// Add every point into the running sum of the cluster it was assigned to, and count it.
+/// The sums are double, not float: they accumulate one term per point, and float would drift.
 void accumulateSums(
-    const Float * __restrict pts, size_t n, size_t d,
-    const UInt32 * __restrict assign, double * __restrict sums, UInt64 * __restrict counts)
+    const Float * __restrict points, size_t num_points, size_t dim,
+    const UInt32 * __restrict assignment, double * __restrict sums, UInt64 * __restrict counts)
 {
-    for (size_t i = 0; i < n; ++i)
+    for (size_t row = 0; row < num_points; ++row)
     {
-        const size_t c = assign[i];
-        ++counts[c];
-        const Float * __restrict x = pts + i * d;
-        double * __restrict s = sums + c * d;
-        for (size_t j = 0; j < d; ++j)
-            s[j] += static_cast<double>(x[j]);
+        const size_t cluster = assignment[row];
+        ++counts[cluster];
+        const Float * __restrict point = points + row * dim;
+        double * __restrict cluster_sums = sums + cluster * dim;
+        for (size_t coord = 0; coord < dim; ++coord)
+            cluster_sums[coord] += static_cast<double>(point[coord]);
     }
 }
 
@@ -205,58 +208,58 @@ void accumulateSums(
 /// build with `ENABLE_MULTITARGET_CODE=OFF`) only `Default` exists, which is why the kernels above are
 /// written as plain contiguous loops the compiler can auto-vectorize on its own.
 void assignRows(
-    const Float * pts, size_t n, size_t d, const Float * ct, const Float * cnorm, size_t k,
-    UInt32 * assign, Float * best_out)
+    const Float * points, size_t num_points, size_t dim, const Float * centroids_transposed, const Float * centroid_sq_norms, size_t num_centroids,
+    UInt32 * assignment, Float * best_score_out)
 {
 #if USE_MULTITARGET_CODE
     if (isArchSupported(TargetArch::x86_64_v4))
     {
-        TargetSpecific::x86_64_v4::assignRows(pts, n, d, ct, cnorm, k, assign, best_out);
+        TargetSpecific::x86_64_v4::assignRows(points, num_points, dim, centroids_transposed, centroid_sq_norms, num_centroids, assignment, best_score_out);
         return;
     }
     if (isArchSupported(TargetArch::x86_64_v3))
     {
-        TargetSpecific::x86_64_v3::assignRows(pts, n, d, ct, cnorm, k, assign, best_out);
+        TargetSpecific::x86_64_v3::assignRows(points, num_points, dim, centroids_transposed, centroid_sq_norms, num_centroids, assignment, best_score_out);
         return;
     }
 #endif
-    TargetSpecific::Default::assignRows(pts, n, d, ct, cnorm, k, assign, best_out);
+    TargetSpecific::Default::assignRows(points, num_points, dim, centroids_transposed, centroid_sq_norms, num_centroids, assignment, best_score_out);
 }
 
-double updateMinSqDist(const Float * pts, size_t n, size_t d, const Float * cen, Float * best_d2)
+double updateMinSqDist(const Float * points, size_t num_points, size_t dim, const Float * centroid, Float * best_sq_dist)
 {
 #if USE_MULTITARGET_CODE
     if (isArchSupported(TargetArch::x86_64_v4))
-        return TargetSpecific::x86_64_v4::updateMinSqDist(pts, n, d, cen, best_d2);
+        return TargetSpecific::x86_64_v4::updateMinSqDist(points, num_points, dim, centroid, best_sq_dist);
     if (isArchSupported(TargetArch::x86_64_v3))
-        return TargetSpecific::x86_64_v3::updateMinSqDist(pts, n, d, cen, best_d2);
+        return TargetSpecific::x86_64_v3::updateMinSqDist(points, num_points, dim, centroid, best_sq_dist);
 #endif
-    return TargetSpecific::Default::updateMinSqDist(pts, n, d, cen, best_d2);
+    return TargetSpecific::Default::updateMinSqDist(points, num_points, dim, centroid, best_sq_dist);
 }
 
 void accumulateSums(
-    const Float * pts, size_t n, size_t d, const UInt32 * assign, double * sums, UInt64 * counts)
+    const Float * points, size_t num_points, size_t dim, const UInt32 * assignment, double * sums, UInt64 * counts)
 {
 #if USE_MULTITARGET_CODE
     if (isArchSupported(TargetArch::x86_64_v4))
     {
-        TargetSpecific::x86_64_v4::accumulateSums(pts, n, d, assign, sums, counts);
+        TargetSpecific::x86_64_v4::accumulateSums(points, num_points, dim, assignment, sums, counts);
         return;
     }
     if (isArchSupported(TargetArch::x86_64_v3))
     {
-        TargetSpecific::x86_64_v3::accumulateSums(pts, n, d, assign, sums, counts);
+        TargetSpecific::x86_64_v3::accumulateSums(points, num_points, dim, assignment, sums, counts);
         return;
     }
 #endif
-    TargetSpecific::Default::accumulateSums(pts, n, d, assign, sums, counts);
+    TargetSpecific::Default::accumulateSums(points, num_points, dim, assignment, sums, counts);
 }
 
 /// --- threading helpers ---
 
-/// Training the IVF coarse quantizer is the same kind of work as building a vector similarity index, so it
-/// reuses that setting and that global pool - sharing the pool is what stops several concurrent trainings
-/// (or a training racing a merge that builds an index) from oversubscribing the box.
+/// Training a coarse quantizer is the same kind of work as building a vector similarity index, so it reuses
+/// that setting and that global pool. Sharing one pool is what keeps concurrent trainings, or a training
+/// running alongside an index build, from oversubscribing the machine.
 size_t getMaxTrainingThreads()
 {
     size_t threads = Context::getGlobalContextInstance()->getServerSettings()[ServerSetting::max_build_vector_similarity_index_thread_pool_size];
@@ -278,27 +281,27 @@ void throwIfKilled()
             query_status->throwIfKilled();
 }
 
-/// Split `[0, n)` into `num_threads` fixed contiguous ranges and run `body(begin, end, thread_index)` on each.
-/// The ranges and the output slot of every row are fixed up front, so results never depend on scheduling -
-/// that is what keeps training reproducible for a given seed.
+/// Split `[0, num_items)` into `num_threads` contiguous ranges and run `body(begin, end, thread_index)` on
+/// each. The ranges are fixed up front and every row writes to a slot of its own, so the result does not
+/// depend on the order threads finish in. That is what makes training reproducible for a given seed.
 template <typename Body>
-void parallelRanges(size_t n, size_t num_threads, Body && body)
+void parallelRanges(size_t num_items, size_t num_threads, Body && body)
 {
-    if (num_threads <= 1 || n == 0)
+    if (num_threads <= 1 || num_items == 0)
     {
-        body(0, n, 0);
+        body(0, num_items, 0);
         return;
     }
 
-    const size_t per_thread = (n + num_threads - 1) / num_threads;
+    const size_t per_thread = (num_items + num_threads - 1) / num_threads;
     ThreadPoolCallbackRunnerLocal<void> runner(getTrainingThreadPool(), ThreadName::MERGETREE_VECTOR_SIM_INDEX);
-    for (size_t t = 0; t < num_threads; ++t)
+    for (size_t thread = 0; thread < num_threads; ++thread)
     {
-        const size_t begin = t * per_thread;
-        if (begin >= n)
+        const size_t begin = thread * per_thread;
+        if (begin >= num_items)
             break;
-        const size_t end = std::min(n, begin + per_thread);
-        runner.enqueueAndKeepTrack([&body, begin, end, t] { body(begin, end, t); });
+        const size_t end = std::min(num_items, begin + per_thread);
+        runner.enqueueAndKeepTrack([&body, begin, end, thread] { body(begin, end, thread); });
     }
     runner.waitForAllToFinishAndRethrowFirstError();
 }
@@ -315,181 +318,181 @@ struct KMeansParams
 /// Renormalize centroids to unit length, which turns the L2 argmin into an exact cosine argmin. The
 /// guarantee must be absolute or `assignCentroid` ends up ranking against a direction-less centroid.
 /// Zero-norm inputs are rejected at `add`, so a zero here is an exactly cancelling mean - substitute e0.
-void normalizeCentroids(Float * centroids, size_t k, size_t d)
+void normalizeCentroids(Float * centroids, size_t num_centroids, size_t dim)
 {
-    for (size_t c = 0; c < k; ++c)
+    for (size_t cluster = 0; cluster < num_centroids; ++cluster)
     {
-        Float * cen = centroids + c * d;
-        double norm2 = 0;
-        for (size_t j = 0; j < d; ++j)
-            norm2 += static_cast<double>(cen[j]) * static_cast<double>(cen[j]);
+        Float * centroid = centroids + cluster * dim;
+        double sq_norm = 0;
+        for (size_t coord = 0; coord < dim; ++coord)
+            sq_norm += static_cast<double>(centroid[coord]) * static_cast<double>(centroid[coord]);
 
-        if (norm2 > 0)
+        if (sq_norm > 0)
         {
-            const Float inv = static_cast<Float>(1.0 / std::sqrt(norm2));
-            for (size_t j = 0; j < d; ++j)
-                cen[j] *= inv;
+            const Float inv_norm = static_cast<Float>(1.0 / std::sqrt(sq_norm));
+            for (size_t coord = 0; coord < dim; ++coord)
+                centroid[coord] *= inv_norm;
         }
         else
         {
-            std::fill(cen, cen + d, 0.0f);
-            cen[0] = 1.0f;
+            std::fill(centroid, centroid + dim, 0.0f);
+            centroid[0] = 1.0f;
         }
     }
 }
 
-/// Pack row-major centroids into the column-major layout `assignRows` wants, and their squared norms.
-void packCentroids(const Float * rows, size_t k, size_t d, Float * ct, Float * cnorm)
+/// Transpose row-major centroids into the column-major layout `assignRows` wants, and their squared norms.
+void transposeCentroids(const Float * row_major, size_t num_centroids, size_t dim, Float * centroids_transposed, Float * centroid_sq_norms)
 {
-    for (size_t c = 0; c < k; ++c)
+    for (size_t cluster = 0; cluster < num_centroids; ++cluster)
     {
-        const Float * cen = rows + c * d;
-        double s = 0;
-        for (size_t j = 0; j < d; ++j)
+        const Float * centroid = row_major + cluster * dim;
+        double sq_norm = 0;
+        for (size_t coord = 0; coord < dim; ++coord)
         {
-            ct[j * k + c] = cen[j];
-            s += static_cast<double>(cen[j]) * static_cast<double>(cen[j]);
+            centroids_transposed[coord * num_centroids + cluster] = centroid[coord];
+            sq_norm += static_cast<double>(centroid[coord]) * static_cast<double>(centroid[coord]);
         }
-        cnorm[c] = static_cast<Float>(s);
+        centroid_sq_norms[cluster] = static_cast<Float>(sq_norm);
     }
 }
 
-/// Flat Lloyd k-means: `n` points of dimension `d` -> `k` row-major centroids (`k * d` floats).
-/// k-means++ seeding, argmin via the reformulation above, and empty-cluster reseeding.
+/// Flat Lloyd k-means: `num_points` points of dimension `dim` in, `num_centroids` row-major centroids out.
+/// k-means++ seeding, nearest-centroid assignment via `assignRows`, and reseeding of empty clusters.
 VectorWithMemoryTracking<Float> kMeansLloyd(
-    const Float * pts, size_t n, size_t d, size_t k, const KMeansParams & params, pcg64 & rng)
+    const Float * points, size_t num_points, size_t dim, size_t num_centroids, const KMeansParams & params, pcg64 & rng)
 {
-    k = std::min(k, n);
-    VectorWithMemoryTracking<Float> centroids(k * d);
-    if (k == 0)
+    num_centroids = std::min(num_centroids, num_points);
+    VectorWithMemoryTracking<Float> centroids(num_centroids * dim);
+    if (num_centroids == 0)
         return centroids;
 
     const size_t num_threads = std::max<size_t>(params.num_threads, 1);
 
     /// --- k-means++ initialization ---
-    VectorWithMemoryTracking<Float> best_d2(n, std::numeric_limits<Float>::max());
-    VectorWithMemoryTracking<double> partial(num_threads, 0.0);
+    VectorWithMemoryTracking<Float> best_sq_dist(num_points, std::numeric_limits<Float>::max());
+    VectorWithMemoryTracking<double> partial_sums(num_threads, 0.0);
     {
-        const size_t first = rng() % n;
-        std::copy(pts + first * d, pts + (first + 1) * d, centroids.begin());
+        const size_t first_row = rng() % num_points;
+        std::copy(points + first_row * dim, points + (first_row + 1) * dim, centroids.begin());
     }
-    for (size_t c = 1; c < k; ++c)
+    for (size_t cluster = 1; cluster < num_centroids; ++cluster)
     {
-        const Float * prev = &centroids[(c - 1) * d];
-        std::fill(partial.begin(), partial.end(), 0.0);
-        parallelRanges(n, num_threads, [&](size_t begin, size_t end, size_t t)
+        const Float * previous_centroid = &centroids[(cluster - 1) * dim];
+        std::fill(partial_sums.begin(), partial_sums.end(), 0.0);
+        parallelRanges(num_points, num_threads, [&](size_t begin, size_t end, size_t thread)
         {
-            partial[t] = updateMinSqDist(pts + begin * d, end - begin, d, prev, best_d2.data() + begin);
+            partial_sums[thread] = updateMinSqDist(points + begin * dim, end - begin, dim, previous_centroid, best_sq_dist.data() + begin);
         });
 
         /// Reduced in thread order, not completion order, so the sampling threshold is bit-reproducible.
-        double sum = 0;
-        for (size_t t = 0; t < num_threads; ++t)
-            sum += partial[t];
+        double total_sq_dist = 0;
+        for (size_t thread = 0; thread < num_threads; ++thread)
+            total_sq_dist += partial_sums[thread];
 
-        const double r = (static_cast<double>(rng()) / (static_cast<double>(std::numeric_limits<UInt64>::max()) + 1.0)) * sum;
-        double acc = 0;
-        size_t pick = n - 1;
-        for (size_t i = 0; i < n; ++i)
+        const double target = (static_cast<double>(rng()) / (static_cast<double>(std::numeric_limits<UInt64>::max()) + 1.0)) * total_sq_dist;
+        double running_sum = 0;
+        size_t picked_row = num_points - 1;
+        for (size_t row = 0; row < num_points; ++row)
         {
-            acc += static_cast<double>(best_d2[i]);
-            if (acc >= r)
+            running_sum += static_cast<double>(best_sq_dist[row]);
+            if (running_sum >= target)
             {
-                pick = i;
+                picked_row = row;
                 break;
             }
         }
-        std::copy(pts + pick * d, pts + (pick + 1) * d, &centroids[c * d]);
+        std::copy(points + picked_row * dim, points + (picked_row + 1) * dim, &centroids[cluster * dim]);
     }
 
     if (params.spherical)
-        normalizeCentroids(centroids.data(), k, d);
+        normalizeCentroids(centroids.data(), num_centroids, dim);
 
     /// --- Lloyd iterations ---
     /// Two assignment buffers: the kernel overwrites as it goes, and the previous assignment is what tells us
     /// whether anything moved (the convergence test).
-    VectorWithMemoryTracking<UInt32> assign(n, std::numeric_limits<UInt32>::max());
-    VectorWithMemoryTracking<UInt32> next_assign(n, 0);
-    VectorWithMemoryTracking<Float> best_score(n, 0.0f);
-    VectorWithMemoryTracking<Float> ct(d * k);
-    VectorWithMemoryTracking<Float> cnorm(k);
-    VectorWithMemoryTracking<double> sums(k * d);
-    VectorWithMemoryTracking<UInt64> counts(k);
+    VectorWithMemoryTracking<UInt32> assignment(num_points, std::numeric_limits<UInt32>::max());
+    VectorWithMemoryTracking<UInt32> next_assignment(num_points, 0);
+    VectorWithMemoryTracking<Float> best_score(num_points, 0.0f);
+    VectorWithMemoryTracking<Float> centroids_transposed(dim * num_centroids);
+    VectorWithMemoryTracking<Float> centroid_sq_norms(num_centroids);
+    VectorWithMemoryTracking<double> sums(num_centroids * dim);
+    VectorWithMemoryTracking<UInt64> counts(num_centroids);
     VectorWithMemoryTracking<UInt8> changed_flags(num_threads);
 
     /// Per-thread accumulation buffers so the mean update is parallel too; leaving it serial would cap the
-    /// speedup by Amdahl. Each is `k * d` doubles, so bound the threads for this step by a memory budget.
+    /// speedup by Amdahl. Each is `num_centroids * dim` doubles, so a memory budget bounds the threads here.
     static constexpr size_t ACCUM_BUDGET_BYTES = 256 * 1024 * 1024;
-    const size_t accum_bytes_per_thread = k * d * sizeof(double) + k * sizeof(UInt64);
+    const size_t accum_bytes_per_thread = num_centroids * dim * sizeof(double) + num_centroids * sizeof(UInt64);
     const size_t accum_threads
         = std::clamp<size_t>(ACCUM_BUDGET_BYTES / std::max<size_t>(accum_bytes_per_thread, 1), 1, num_threads);
-    VectorWithMemoryTracking<double> tsums(accum_threads * k * d);
-    VectorWithMemoryTracking<UInt64> tcounts(accum_threads * k);
+    VectorWithMemoryTracking<double> thread_sums(accum_threads * num_centroids * dim);
+    VectorWithMemoryTracking<UInt64> thread_counts(accum_threads * num_centroids);
 
     for (size_t iteration = 0; iteration < params.iters; ++iteration)
     {
         throwIfKilled();
 
-        packCentroids(centroids.data(), k, d, ct.data(), cnorm.data());
+        transposeCentroids(centroids.data(), num_centroids, dim, centroids_transposed.data(), centroid_sq_norms.data());
 
         std::fill(changed_flags.begin(), changed_flags.end(), 0);
-        parallelRanges(n, num_threads, [&](size_t begin, size_t end, size_t t)
+        parallelRanges(num_points, num_threads, [&](size_t begin, size_t end, size_t thread)
         {
             assignRows(
-                pts + begin * d, end - begin, d, ct.data(), cnorm.data(), k,
-                next_assign.data() + begin, best_score.data() + begin);
+                points + begin * dim, end - begin, dim, centroids_transposed.data(), centroid_sq_norms.data(), num_centroids,
+                next_assignment.data() + begin, best_score.data() + begin);
 
-            for (size_t i = begin; i < end; ++i)
+            for (size_t row = begin; row < end; ++row)
             {
-                if (next_assign[i] != assign[i])
+                if (next_assignment[row] != assignment[row])
                 {
-                    changed_flags[t] = 1;
+                    changed_flags[thread] = 1;
                     break;
                 }
             }
         });
-        assign.swap(next_assign);
+        assignment.swap(next_assignment);
 
         bool changed = false;
-        for (size_t t = 0; t < num_threads; ++t)
-            changed |= changed_flags[t] != 0;
+        for (size_t thread = 0; thread < num_threads; ++thread)
+            changed |= changed_flags[thread] != 0;
 
-        std::fill(tsums.begin(), tsums.end(), 0.0);
-        std::fill(tcounts.begin(), tcounts.end(), 0);
-        parallelRanges(n, accum_threads, [&](size_t begin, size_t end, size_t t)
+        std::fill(thread_sums.begin(), thread_sums.end(), 0.0);
+        std::fill(thread_counts.begin(), thread_counts.end(), 0);
+        parallelRanges(num_points, accum_threads, [&](size_t begin, size_t end, size_t thread)
         {
             accumulateSums(
-                pts + begin * d, end - begin, d, assign.data() + begin,
-                tsums.data() + t * k * d, tcounts.data() + t * k);
+                points + begin * dim, end - begin, dim, assignment.data() + begin,
+                thread_sums.data() + thread * num_centroids * dim, thread_counts.data() + thread * num_centroids);
         });
 
         /// Reduced in thread order for reproducibility.
         std::fill(sums.begin(), sums.end(), 0.0);
         std::fill(counts.begin(), counts.end(), 0);
-        for (size_t t = 0; t < accum_threads; ++t)
+        for (size_t thread = 0; thread < accum_threads; ++thread)
         {
-            const double * ts = tsums.data() + t * k * d;
-            const UInt64 * tc = tcounts.data() + t * k;
-            for (size_t idx = 0; idx < k * d; ++idx)
-                sums[idx] += ts[idx];
-            for (size_t c = 0; c < k; ++c)
-                counts[c] += tc[c];
+            const double * thread_sum = thread_sums.data() + thread * num_centroids * dim;
+            const UInt64 * thread_count = thread_counts.data() + thread * num_centroids;
+            for (size_t offset = 0; offset < num_centroids * dim; ++offset)
+                sums[offset] += thread_sum[offset];
+            for (size_t cluster = 0; cluster < num_centroids; ++cluster)
+                counts[cluster] += thread_count[cluster];
         }
 
-        for (size_t c = 0; c < k; ++c)
+        for (size_t cluster = 0; cluster < num_centroids; ++cluster)
         {
-            if (counts[c] == 0)
+            if (counts[cluster] == 0)
             {
-                const size_t r = rng() % n; /// reseed an empty cluster with a random point
-                std::copy(pts + r * d, pts + (r + 1) * d, &centroids[c * d]);
+                const size_t random_row = rng() % num_points; /// reseed an empty cluster with a random point
+                std::copy(points + random_row * dim, points + (random_row + 1) * dim, &centroids[cluster * dim]);
                 continue;
             }
-            for (size_t j = 0; j < d; ++j)
-                centroids[c * d + j] = static_cast<Float>(sums[c * d + j] / static_cast<double>(counts[c]));
+            for (size_t coord = 0; coord < dim; ++coord)
+                centroids[cluster * dim + coord] = static_cast<Float>(sums[cluster * dim + coord] / static_cast<double>(counts[cluster]));
         }
 
         if (params.spherical)
-            normalizeCentroids(centroids.data(), k, d);
+            normalizeCentroids(centroids.data(), num_centroids, dim);
 
         if (!changed && iteration > 0)
             break;
@@ -498,70 +501,71 @@ VectorWithMemoryTracking<Float> kMeansLloyd(
     return centroids;
 }
 
-/// Split `k` leaves across the `B` children, proportional to population (largest-remainder). Two rules, and
-/// breaking either silently loses centroids: a child with no points gets no leaves, and no child gets more
-/// leaves than points. What that displaces goes to children with headroom, so the total is exactly `k`.
-VectorWithMemoryTracking<size_t> apportion(const VectorWithMemoryTracking<size_t> & pop, size_t k)
+/// Split `num_leaves` leaves across the children, proportional to how many points each holds
+/// (largest-remainder apportionment). Two rules: an empty child gets no leaves, and no child gets more leaves
+/// than it has points. Leaves displaced by those rules go to children with headroom, so the total is exactly
+/// `num_leaves`.
+VectorWithMemoryTracking<size_t> apportion(const VectorWithMemoryTracking<size_t> & population, size_t num_leaves)
 {
-    const size_t B = pop.size();
-    VectorWithMemoryTracking<size_t> leaves(B, 0);
+    const size_t num_children = population.size();
+    VectorWithMemoryTracking<size_t> leaves(num_children, 0);
 
-    const size_t capacity = std::accumulate(pop.begin(), pop.end(), static_cast<size_t>(0));
-    k = std::min(k, capacity); /// cannot produce more centroids than there are points
-    if (k == 0)
+    const size_t capacity = std::accumulate(population.begin(), population.end(), static_cast<size_t>(0));
+    num_leaves = std::min(num_leaves, capacity); /// cannot produce more centroids than there are points
+    if (num_leaves == 0)
         return leaves;
 
-    /// Seed one leaf per non-empty child, largest first, so that a `k` smaller than the number of non-empty
-    /// children goes to the biggest ones.
-    VectorWithMemoryTracking<size_t> by_pop(B);
-    std::iota(by_pop.begin(), by_pop.end(), 0);
-    std::sort(by_pop.begin(), by_pop.end(), [&](size_t a, size_t b) { return pop[a] > pop[b]; });
+    /// Seed one leaf per non-empty child, largest first, so that a `num_leaves` smaller than the number of
+    /// non-empty children goes to the biggest ones.
+    VectorWithMemoryTracking<size_t> by_population(num_children);
+    std::iota(by_population.begin(), by_population.end(), 0);
+    std::sort(by_population.begin(), by_population.end(), [&](size_t lhs, size_t rhs) { return population[lhs] > population[rhs]; });
 
     size_t placed = 0;
-    for (size_t i = 0; i < B && placed < k; ++i)
+    for (size_t rank = 0; rank < num_children && placed < num_leaves; ++rank)
     {
-        const size_t c = by_pop[i];
-        if (pop[c] == 0)
+        const size_t child = by_population[rank];
+        if (population[child] == 0)
             break; /// sorted by population, so every child after this one is empty too
-        leaves[c] = 1;
+        leaves[child] = 1;
         ++placed;
     }
 
-    const size_t remaining = k - placed;
+    const size_t remaining = num_leaves - placed;
     if (remaining == 0)
         return leaves;
 
-    VectorWithMemoryTracking<double> frac(B, 0.0);
-    size_t handed = 0;
-    for (size_t c = 0; c < B; ++c)
+    VectorWithMemoryTracking<double> fraction(num_children, 0.0);
+    size_t placed_by_floor = 0;
+    for (size_t child = 0; child < num_children; ++child)
     {
-        if (leaves[c] == 0)
+        if (leaves[child] == 0)
             continue;
-        const double exact = static_cast<double>(remaining) * static_cast<double>(pop[c]) / static_cast<double>(capacity);
-        size_t add = std::min(static_cast<size_t>(std::floor(exact)), pop[c] - leaves[c]);
-        leaves[c] += add;
-        frac[c] = exact - std::floor(exact);
-        handed += add;
+        const double exact = static_cast<double>(remaining) * static_cast<double>(population[child]) / static_cast<double>(capacity);
+        size_t extra = std::min(static_cast<size_t>(std::floor(exact)), population[child] - leaves[child]);
+        leaves[child] += extra;
+        fraction[child] = exact - std::floor(exact);
+        placed_by_floor += extra;
     }
 
     /// Largest remainder first, then keep sweeping for anything the per-child capacity clamp displaced.
     /// Terminates: every sweep either places a leaf or stops, and total placement is bounded by `capacity`.
-    VectorWithMemoryTracking<size_t> by_frac(B);
-    std::iota(by_frac.begin(), by_frac.end(), 0);
-    std::sort(by_frac.begin(), by_frac.end(), [&](size_t a, size_t b) { return frac[a] > frac[b]; });
+    VectorWithMemoryTracking<size_t> by_fraction(num_children);
+    std::iota(by_fraction.begin(), by_fraction.end(), 0);
+    std::sort(by_fraction.begin(), by_fraction.end(), [&](size_t lhs, size_t rhs) { return fraction[lhs] > fraction[rhs]; });
 
-    size_t left = remaining - handed;
+    size_t still_to_place = remaining - placed_by_floor;
     bool progress = true;
-    while (left > 0 && progress)
+    while (still_to_place > 0 && progress)
     {
         progress = false;
-        for (size_t i = 0; i < B && left > 0; ++i)
+        for (size_t rank = 0; rank < num_children && still_to_place > 0; ++rank)
         {
-            const size_t c = by_frac[i];
-            if (leaves[c] > 0 && leaves[c] < pop[c])
+            const size_t child = by_fraction[rank];
+            if (leaves[child] > 0 && leaves[child] < population[child])
             {
-                ++leaves[c];
-                --left;
+                ++leaves[child];
+                --still_to_place;
                 progress = true;
             }
         }
@@ -595,107 +599,106 @@ UInt64 mixSeed(UInt64 seed, size_t child)
 
 /// Run one node: emit whatever leaf centroids it resolves directly, and hand back the children it spawns.
 void processTask(
-    const TrainTask & task, const Float * sample, size_t sample_rows, size_t d, size_t branching,
+    const TrainTask & task, const Float * sample, size_t sample_rows, size_t dim, size_t branching,
     const KMeansParams & params, VectorWithMemoryTracking<Float> & out_centroids, TaskList & out_children)
 {
-    const size_t n = task.all_rows ? sample_rows : task.rows.size();
-    const size_t k = task.leaves;
-    if (k == 0 || n == 0)
+    const size_t num_points = task.all_rows ? sample_rows : task.rows.size();
+    const size_t num_leaves = task.leaves;
+    if (num_leaves == 0 || num_points == 0)
         return;
 
-    /// Gather this node's rows contiguously (the kernels want row-major contiguous input). The root reads the
-    /// sample in place.
+    /// The kernels take a contiguous row-major buffer, so gather this node's rows into one. The root covers
+    /// the whole sample and can read it in place.
     VectorWithMemoryTracking<Float> gathered;
-    const Float * pts = sample;
+    const Float * points = sample;
     if (!task.all_rows)
     {
-        gathered.resize(n * d);
-        for (size_t i = 0; i < n; ++i)
-            memcpy(&gathered[i * d], sample + static_cast<size_t>(task.rows[i]) * d, d * sizeof(Float));
-        pts = gathered.data();
+        gathered.resize(num_points * dim);
+        for (size_t row = 0; row < num_points; ++row)
+            memcpy(&gathered[row * dim], sample + static_cast<size_t>(task.rows[row]) * dim, dim * sizeof(Float));
+        points = gathered.data();
     }
 
     pcg64 rng(task.seed);
 
-    if (k >= n) /// fewer points than requested leaves: every point becomes a centroid
+    if (num_leaves >= num_points) /// fewer points than requested leaves: every point becomes a centroid
     {
-        out_centroids.insert(out_centroids.end(), pts, pts + n * d);
+        out_centroids.insert(out_centroids.end(), points, points + num_points * dim);
         return;
     }
 
-    if (k <= branching) /// base case: a single flat k-means with `k` clusters
+    if (num_leaves <= branching) /// base case: a single flat_centroids num_leaves-means with `num_leaves` clusters
     {
-        auto centroids = kMeansLloyd(pts, n, d, k, params, rng);
+        auto centroids = kMeansLloyd(points, num_points, dim, num_leaves, params, rng);
         out_centroids.insert(out_centroids.end(), centroids.begin(), centroids.end());
         return;
     }
 
-    const size_t br = branching;
-    auto node = kMeansLloyd(pts, n, d, br, params, rng);
+    auto node_centroids = kMeansLloyd(points, num_points, dim, branching, params, rng);
 
-    VectorWithMemoryTracking<Float> ct(d * br);
-    VectorWithMemoryTracking<Float> cnorm(br);
-    packCentroids(node.data(), br, d, ct.data(), cnorm.data());
+    VectorWithMemoryTracking<Float> centroids_transposed(dim * branching);
+    VectorWithMemoryTracking<Float> centroid_sq_norms(branching);
+    transposeCentroids(node_centroids.data(), branching, dim, centroids_transposed.data(), centroid_sq_norms.data());
 
-    VectorWithMemoryTracking<UInt32> assign(n);
-    VectorWithMemoryTracking<Float> score(n);
-    parallelRanges(n, std::max<size_t>(params.num_threads, 1), [&](size_t begin, size_t end, size_t)
+    VectorWithMemoryTracking<UInt32> assignment(num_points);
+    VectorWithMemoryTracking<Float> best_score(num_points);
+    parallelRanges(num_points, std::max<size_t>(params.num_threads, 1), [&](size_t begin, size_t end, size_t)
     {
         assignRows(
-            pts + begin * d, end - begin, d, ct.data(), cnorm.data(), br,
-            assign.data() + begin, score.data() + begin);
+            points + begin * dim, end - begin, dim, centroids_transposed.data(), centroid_sq_norms.data(), branching,
+            assignment.data() + begin, best_score.data() + begin);
     });
 
-    VectorWithMemoryTracking<size_t> pop(br, 0);
-    for (size_t i = 0; i < n; ++i)
-        ++pop[assign[i]];
+    VectorWithMemoryTracking<size_t> population(branching, 0);
+    for (size_t row = 0; row < num_points; ++row)
+        ++population[assignment[row]];
 
-    /// If one child captured every point the split made no progress, and `apportion` would hand it all `k`
-    /// leaves - the walk would then reproduce this node forever (all-identical points, say). Emit a flat
-    /// k-means instead. Past this check every child is strictly smaller than its parent, bounding the walk.
+    /// If one child captured every point, the split made no progress and the walk would reproduce this node
+    /// forever (all-identical points, say). Emit a flat k-means instead. Past this check every child is
+    /// strictly smaller than its parent, which is what bounds the walk.
     size_t non_empty = 0;
-    for (size_t c = 0; c < br; ++c)
-        non_empty += (pop[c] > 0);
+    for (size_t cluster = 0; cluster < branching; ++cluster)
+        non_empty += (population[cluster] > 0);
     if (non_empty <= 1)
     {
-        auto flat = kMeansLloyd(pts, n, d, k, params, rng);
-        out_centroids.insert(out_centroids.end(), flat.begin(), flat.end());
+        auto flat_centroids = kMeansLloyd(points, num_points, dim, num_leaves, params, rng);
+        out_centroids.insert(out_centroids.end(), flat_centroids.begin(), flat_centroids.end());
         return;
     }
 
-    auto leaves = apportion(pop, k);
+    auto leaves = apportion(population, num_leaves);
 
-    for (size_t c = 0; c < br; ++c)
+    for (size_t cluster = 0; cluster < branching; ++cluster)
     {
-        if (leaves[c] == 0 || pop[c] == 0)
+        if (leaves[cluster] == 0 || population[cluster] == 0)
             continue;
-        if (leaves[c] == 1) /// keep the node centroid itself as the single leaf
+        if (leaves[cluster] == 1) /// keep the node_centroids centroid itself as the single leaf
         {
-            out_centroids.insert(out_centroids.end(), node.data() + c * d, node.data() + (c + 1) * d);
+            out_centroids.insert(out_centroids.end(), node_centroids.data() + cluster * dim, node_centroids.data() + (cluster + 1) * dim);
             continue;
         }
 
         TrainTask child;
-        child.leaves = leaves[c];
-        child.seed = mixSeed(task.seed, c);
-        child.rows.reserve(pop[c]);
+        child.leaves = leaves[cluster];
+        child.seed = mixSeed(task.seed, cluster);
+        child.rows.reserve(population[cluster]);
         /// Children carry indices into the WHOLE sample, so a gather is always one hop from the original
         /// buffer rather than a copy of a copy at every level.
-        for (size_t i = 0; i < n; ++i)
-            if (assign[i] == c)
-                child.rows.push_back(task.all_rows ? static_cast<UInt32>(i) : task.rows[i]);
+        for (size_t row = 0; row < num_points; ++row)
+            if (assignment[row] == cluster)
+                child.rows.push_back(task.all_rows ? static_cast<UInt32>(row) : task.rows[row]);
         out_children.push_back(std::move(child));
     }
 }
 
-/// Breadth-first walk of the training tree, appending the `k` leaf centroids to `out`. Not recursive: near
+/// Breadth-first walk of the training tree, appending the `num_centroids` leaf centroids to `out`. Not recursive: near
 /// the root a few nodes hold most points so ROWS split across threads, deep down thousands of tiny NODES run
 /// concurrently, and nesting the two would deadlock the pool - so each level picks exactly one regime.
 void trainHierarchical(
-    const Float * sample, size_t sample_rows, size_t d, size_t k, size_t branching,
+    const Float * sample, size_t sample_rows, size_t dim, size_t num_centroids, size_t branching,
     size_t iters, bool spherical, UInt64 seed, PaddedPODArray<Float> & out)
 {
-    if (k == 0 || sample_rows == 0)
+    if (num_centroids == 0 || sample_rows == 0)
         return;
 
     const size_t max_threads = getMaxTrainingThreads();
@@ -704,7 +707,7 @@ void trainHierarchical(
     {
         TrainTask root;
         root.all_rows = true;
-        root.leaves = k;
+        root.leaves = num_centroids;
         root.seed = mixSeed(seed, 0); /// same de-correlation as the reservoir RNG
         level.push_back(std::move(root));
     }
@@ -712,20 +715,20 @@ void trainHierarchical(
     while (!level.empty())
     {
         const size_t num_tasks = level.size();
-        VectorWithMemoryTracking<VectorWithMemoryTracking<Float>> outs(num_tasks);
-        VectorWithMemoryTracking<TaskList> kids(num_tasks);
+        VectorWithMemoryTracking<VectorWithMemoryTracking<Float>> level_centroids(num_tasks);
+        VectorWithMemoryTracking<TaskList> children(num_tasks);
 
         if (max_threads > 1 && num_tasks >= max_threads)
         {
             /// Enough independent nodes to fill the pool: one pooled task per node, each node serial inside.
             const KMeansParams params{iters, spherical, 1};
             ThreadPoolCallbackRunnerLocal<void> runner(getTrainingThreadPool(), ThreadName::MERGETREE_VECTOR_SIM_INDEX);
-            for (size_t i = 0; i < num_tasks; ++i)
+            for (size_t index = 0; index < num_tasks; ++index)
             {
-                runner.enqueueAndKeepTrack([&, i]
+                runner.enqueueAndKeepTrack([&, index]
                 {
                     throwIfKilled();
-                    processTask(level[i], sample, sample_rows, d, branching, params, outs[i], kids[i]);
+                    processTask(level[index], sample, sample_rows, dim, branching, params, level_centroids[index], children[index]);
                 });
             }
             runner.waitForAllToFinishAndRethrowFirstError();
@@ -734,44 +737,47 @@ void trainHierarchical(
         {
             /// Too few nodes to fill the pool: walk them one at a time, parallelizing over rows instead.
             const KMeansParams params{iters, spherical, max_threads};
-            for (size_t i = 0; i < num_tasks; ++i)
+            for (size_t index = 0; index < num_tasks; ++index)
             {
                 throwIfKilled();
-                processTask(level[i], sample, sample_rows, d, branching, params, outs[i], kids[i]);
+                processTask(level[index], sample, sample_rows, dim, branching, params, level_centroids[index], children[index]);
             }
         }
 
         /// Concatenated in task order, so the output never depends on completion order.
-        for (size_t i = 0; i < num_tasks; ++i)
-            out.insert(outs[i].data(), outs[i].data() + outs[i].size());
+        for (size_t index = 0; index < num_tasks; ++index)
+            out.insert(level_centroids[index].data(), level_centroids[index].data() + level_centroids[index].size());
 
         TaskList next;
-        for (size_t i = 0; i < num_tasks; ++i)
-            for (auto & child : kids[i])
+        for (size_t index = 0; index < num_tasks; ++index)
+            for (auto & child : children[index])
                 next.push_back(std::move(child));
         level = std::move(next);
     }
 
-    /// The `k >= n` shortcut emits raw sample points, which are not unit length; normalize the final set so
-    /// every emitted centroid satisfies the spherical contract regardless of which path produced it.
+    /// A node with fewer points than leaves emits raw sample points, which are not unit length. Normalize the
+    /// final set so every centroid is a unit direction whichever path produced it.
     if (spherical && !out.empty())
-        normalizeCentroids(out.data(), out.size() / d, d);
+        normalizeCentroids(out.data(), out.size() / dim, dim);
 }
 
 /// Aggregate state: a bounded reservoir of training vectors (uniform sample of the input stream).
+///
+/// The sampling is Vitter's Algorithm R, the textbook reservoir algorithm: keep the first `cap` vectors,
+/// then keep the `i`-th vector with probability `cap / i`, replacing a uniformly chosen slot. Every prefix
+/// of the stream therefore leaves a uniform sample of everything seen so far.
 struct HierarchicalKMeansData
 {
     PaddedPODArray<Float> samples; /// flat, (samples.size() / dim) vectors
     UInt64 seen = 0;
     UInt32 dim = 0;
 
-    /// `pcg32_fast` not `pcg64` because this generator is serialized: `IO/Operators_pcg_random.h` round-trips
-    /// it, while pcg's stream operators cannot emit `pcg64`'s 128-bit state. The training RNG stays `pcg64`.
+    /// `pcg32_fast`, not `pcg64`, because this generator is serialized and `IO/Operators_pcg_random.h`
+    /// only has operators for `pcg32_fast`. The training RNG, which is not serialized, is `pcg64`.
     pcg32_fast rng; /// seeded in create()
 
-    /// Uniform in `[0, limit)`. One 32-bit draw does not cover a `limit` past 2^32, which `seen` reaches on a
-    /// long stream, so widen with a second draw as `ReservoirSampler` does. The `limit == 0` guard is for the
-    /// analyzer, which cannot see that every caller has just established the value is positive.
+    /// Uniform in `[0, limit)`. A `limit` past 2^32 needs a second draw to cover, the way `ReservoirSampler`
+    /// does it, because `seen` grows past that on a long stream.
     UInt64 genRandom(UInt64 limit)
     {
         if (limit == 0)
@@ -783,59 +789,57 @@ struct HierarchicalKMeansData
 
     static constexpr size_t no_slot = std::numeric_limits<size_t>::max();
 
-    /// Advance the reservoir for one incoming vector and return the row it should occupy, or `no_slot` when
-    /// Algorithm R discards it. Deciding before copying is what keeps `add` allocation-free: a discarded row
-    /// costs nothing, and a kept one is written straight into the reservoir rather than staged in a temporary.
+    /// Pick the slot one incoming vector should occupy, or `no_slot` if the reservoir keeps what it has.
+    /// The caller writes the vector straight into that slot, so a discarded vector is never copied.
     ///
-    /// `dim == 0` is the "no rows yet" sentinel, so an empty input array would both make the state
-    /// indistinguishable from empty and turn `samples.size() / dim` into a division by zero. Arrays are
-    /// allowed to be empty, so this has to be rejected rather than assumed away.
-    size_t reserveSlot(UInt32 d, UInt64 cap)
+    /// An empty vector is rejected: `dim == 0` already means "no rows yet", and `samples.size() / dim` would
+    /// divide by zero.
+    size_t reserveSlot(UInt32 incoming_dim, UInt64 cap)
     {
-        if (d == 0)
+        if (incoming_dim == 0)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "hierarchicalKMeans: input vector must not be empty");
 
         if (dim == 0)
-            dim = d;
-        if (d != dim)
+            dim = incoming_dim;
+        if (incoming_dim != dim)
             throw Exception(ErrorCodes::SIZES_OF_ARRAYS_DONT_MATCH,
-                "hierarchicalKMeans: got a vector of size {} but expected {}", d, dim);
+                "hierarchicalKMeans: got a vector of size {} but expected {}", incoming_dim, dim);
 
         ++seen;
         const UInt64 have = samples.size() / dim;
         if (have < cap)
         {
-            samples.resize(samples.size() + d);
+            samples.resize(samples.size() + incoming_dim);
             return static_cast<size_t>(have);
         }
 
-        const UInt64 j = genRandom(seen); /// Algorithm R reservoir sampling
-        return j < cap ? static_cast<size_t>(j) : no_slot;
+        const UInt64 candidate_slot = genRandom(seen); /// Algorithm R reservoir sampling
+        return candidate_slot < cap ? static_cast<size_t>(candidate_slot) : no_slot;
     }
 
-    void addVector(const Float * v, UInt32 d, UInt64 cap)
+    void addVector(const Float * vector, UInt32 incoming_dim, UInt64 cap)
     {
-        const size_t slot = reserveSlot(d, cap);
+        const size_t slot = reserveSlot(incoming_dim, cap);
         if (slot != no_slot)
-            memcpy(&samples[slot * dim], v, d * sizeof(Float));
+            memcpy(&samples[slot * dim], vector, incoming_dim * sizeof(Float));
     }
 
     /// Same, but pulling coordinates through `read`, so a Float64 or BFloat16 column converts directly into
     /// the reservoir with no intermediate buffer.
     template <typename Reader>
-    void addVectorFrom(Reader && read, UInt32 d, UInt64 cap)
+    void addVectorFrom(Reader && read, UInt32 incoming_dim, UInt64 cap)
     {
-        const size_t slot = reserveSlot(d, cap);
+        const size_t slot = reserveSlot(incoming_dim, cap);
         if (slot == no_slot)
             return;
-        Float * dst = &samples[slot * dim];
-        for (UInt32 j = 0; j < d; ++j)
-            dst[j] = read(j);
+        Float * destination = &samples[slot * dim];
+        for (UInt32 coord = 0; coord < incoming_dim; ++coord)
+            destination[coord] = read(coord);
     }
 
-    /// Merge two reservoirs into a uniform sample of their union. Every branch must decide RANDOMLY which
-    /// side a kept row comes from: fixing the per-side count to its expectation is neither uniform nor even
-    /// order-independent (`cap = 1`, two one-row states -> `floor(1*1/2) = 0` always drops the left one).
+    /// Merge two reservoirs into a uniform sample of their union. How many rows survive from each side is
+    /// drawn at random, not fixed to the expected count, which would bias the result and make it depend on
+    /// the order the states happen to be merged in.
     void merge(const HierarchicalKMeansData & other, UInt64 cap)
     {
         if (other.dim == 0)
@@ -848,24 +852,23 @@ struct HierarchicalKMeansData
         if (other.dim != dim)
             throw Exception(ErrorCodes::SIZES_OF_ARRAYS_DONT_MATCH, "hierarchicalKMeans: dim mismatch on merge");
 
-        const UInt64 d = dim;
-        const UInt64 have_a = samples.size() / d;
-        const UInt64 have_b = other.samples.size() / d;
+        const UInt64 have_ours = samples.size() / dim;
+        const UInt64 have_theirs = other.samples.size() / dim;
 
-        /// Neither side overflows the reservoir: keeping everything IS the uniform sample.
-        if (have_a + have_b <= cap)
+        /// Neither side ever dropped a row, so keeping everything is already the uniform sample.
+        if (have_ours + have_theirs <= cap)
         {
             samples.insert(other.samples.begin(), other.samples.end());
             seen += other.seen;
             return;
         }
 
-        /// `other` never dropped a row, so replaying its rows through Algorithm R produces exactly the same
-        /// distribution as if they had arrived on this stream in the first place.
+        /// `other` never dropped a row, so replaying its rows one by one gives the same distribution as if
+        /// they had arrived on this stream to begin with.
         if (other.seen <= cap)
         {
-            for (UInt64 i = 0; i < have_b; ++i)
-                addVector(&other.samples[i * d], static_cast<UInt32>(d), cap);
+            for (UInt64 slot = 0; slot < have_theirs; ++slot)
+                addVector(&other.samples[slot * dim], static_cast<UInt32>(dim), cap);
             return;
         }
 
@@ -878,56 +881,52 @@ struct HierarchicalKMeansData
             samples.insert(other.samples.begin(), other.samples.end());
             seen = other.seen;
             rng = other.rng;
-            /// Bounded by the rows actually held rather than by `seen`. The two are equal here - a side with
-            /// `seen <= cap` never dropped anything - but indexing `ours` by its own length is the version
-            /// that stays in bounds if that ever stops holding.
-            for (UInt64 i = 0; i < have_a; ++i)
-                addVector(&ours[i * d], static_cast<UInt32>(d), cap);
+            for (UInt64 slot = 0; slot < have_ours; ++slot)
+                addVector(&ours[slot * dim], static_cast<UInt32>(dim), cap);
             return;
         }
 
-        /// Both sides overflowed, so each holds exactly `cap` rows. How many slots come from `other` is a
-        /// HYPERGEOMETRIC draw over the combined stream - a per-slot coin gives the wrong (binomial) count,
-        /// and picking rows with replacement can duplicate one. The urn simulation below is exact and O(cap).
-        /// See https://en.wikipedia.org/wiki/Hypergeometric_distribution
-        UInt64 take_b = 0;
+        /// Both sides overflowed, so each holds exactly `cap` rows and only `cap` of the `2 * cap` survive.
+        /// How many come from `other` follows the hypergeometric distribution - drawing `cap` times from an
+        /// urn without replacement. The loop below is that draw, done directly and in O(cap):
+        /// https://en.wikipedia.org/wiki/Hypergeometric_distribution
+        UInt64 take_theirs = 0;
         {
             UInt64 remaining_total = seen + other.seen;
-            UInt64 remaining_b = other.seen;
-            for (UInt64 i = 0; i < cap; ++i)
+            UInt64 remaining_theirs = other.seen;
+            for (UInt64 slot = 0; slot < cap; ++slot)
             {
-                if (genRandom(remaining_total) < remaining_b)
+                if (genRandom(remaining_total) < remaining_theirs)
                 {
-                    ++take_b;
-                    --remaining_b;
+                    ++take_theirs;
+                    --remaining_theirs;
                 }
                 --remaining_total;
             }
         }
-        const UInt64 take_a = cap - take_b;
+        const UInt64 take_ours = cap - take_theirs;
 
-        /// Both sides then contribute WITHOUT replacement. Subsampling a uniform sample uniformly is itself
-        /// uniform over the underlying stream, so the two halves compose into a uniform sample of the union.
-        /// `take_a <= cap == have_a` and `take_b <= cap == have_b`, so neither side can be over-drawn.
+        /// Each side now contributes that many rows, chosen without replacement. A uniform subsample of a
+        /// uniform sample is again uniform, so the two halves compose into a uniform sample of the union.
 
         /// Partial Fisher-Yates over our own rows, moving the survivors to the front.
-        for (UInt64 i = 0; i < take_a; ++i)
+        for (UInt64 slot = 0; slot < take_ours; ++slot)
         {
-            const UInt64 j = i + genRandom(have_a - i);
-            if (j != i)
-                for (UInt64 t = 0; t < d; ++t)
-                    std::swap(samples[i * d + t], samples[j * d + t]);
+            const UInt64 pick = slot + genRandom(have_ours - slot);
+            if (pick != slot)
+                for (UInt64 coord = 0; coord < dim; ++coord)
+                    std::swap(samples[slot * dim + coord], samples[pick * dim + coord]);
         }
-        samples.resize(take_a * d);
+        samples.resize(take_ours * dim);
 
-        /// Same for `other`, but it is const, so permute an index array rather than the rows.
-        VectorWithMemoryTracking<UInt64> idx(have_b);
-        std::iota(idx.begin(), idx.end(), 0);
-        for (UInt64 i = 0; i < take_b; ++i)
+        /// Same for `other`, but it is const, so permute an index array instead of the rows.
+        VectorWithMemoryTracking<UInt64> order(have_theirs);
+        std::iota(order.begin(), order.end(), 0);
+        for (UInt64 slot = 0; slot < take_theirs; ++slot)
         {
-            const UInt64 j = i + genRandom(have_b - i);
-            std::swap(idx[i], idx[j]);
-            samples.insert(&other.samples[idx[i] * d], &other.samples[(idx[i] + 1) * d]);
+            const UInt64 pick = slot + genRandom(have_theirs - slot);
+            std::swap(order[slot], order[pick]);
+            samples.insert(&other.samples[order[slot] * dim], &other.samples[(order[slot] + 1) * dim]);
         }
 
         seen += other.seen;
@@ -956,7 +955,7 @@ public:
         if (params.size() > 6)
             throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
                 "Aggregate function hierarchicalKMeans accepts at most 6 parameters "
-                "(k, branching, max_iter, sample_cap, seed, spherical), got {}", params.size());
+                "(k, branching, max_iter, sample_cap, seed, cosine_distance), got {}", params.size());
 
         /// Read as a non-negative integer or fail with a message naming the parameter. Going through
         /// `safeGet<UInt64>` alone is not enough: a negative literal is an `Int64` field, so it either raises
@@ -977,7 +976,9 @@ public:
         max_iter   = param(2, "max_iter", 20);
         sample_cap = param(3, "sample_cap", 1'000'000);
         seed       = param(4, "seed", 0);
-        spherical  = param(5, "spherical", 0) != 0;
+        /// Named `cosine_distance` for the user: normalizing the centroids is what makes the L2 argmin
+        /// agree with `cosineDistance`. Internally it stays `spherical`, which is the name of the algorithm.
+        spherical  = param(5, "cosine_distance", 0) != 0;
 
         /// Reject rather than clamp. Silently substituting `branching = 2` for a caller who asked for 1 trains
         /// something other than what was requested, which hides typos and makes experiments irreproducible.
@@ -1039,53 +1040,50 @@ public:
         size_t start = row_num ? offsets[row_num - 1] : 0;
         size_t length = offsets[row_num] - start;
 
-        /// Read the coordinate at `start + j` as Float32, whatever width the column actually holds.
+        /// Read one coordinate as Float32, whatever width the column actually holds.
         const IColumn & nested_col = array.getData();
-        auto coord = [&](size_t j) -> Float
+        auto read_coordinate = [&](size_t coord) -> Float
         {
             switch (nested_type)
             {
-                case TypeIndex::Float32: return assert_cast<const ColumnFloat32 &>(nested_col).getData()[start + j];
-                case TypeIndex::Float64: return static_cast<Float>(assert_cast<const ColumnFloat64 &>(nested_col).getData()[start + j]);
-                default:                 return static_cast<Float>(assert_cast<const ColumnBFloat16 &>(nested_col).getData()[start + j]);
+                case TypeIndex::Float32: return assert_cast<const ColumnFloat32 &>(nested_col).getData()[start + coord];
+                case TypeIndex::Float64: return static_cast<Float>(assert_cast<const ColumnFloat64 &>(nested_col).getData()[start + coord]);
+                default:                 return static_cast<Float>(assert_cast<const ColumnBFloat16 &>(nested_col).getData()[start + coord]);
             }
         };
 
-        /// One pass covering both input contracts.
+        /// One pass that checks the coordinates and computes the norm.
         ///
-        /// Non-finite coordinates are rejected because no comparison against NaN is ever true, so the
-        /// assignment kernel would quietly collect those rows into cluster 0 and the trained centroids could
-        /// come out non-finite. The rest of the vector-search stack treats them as invalid input the same way
-        /// (`checkVectorIsSane` in `MergeTreeIndexVectorSimilarity.cpp`).
+        /// NaN and Inf are rejected: no comparison against NaN is true, so such a row would land in cluster 0
+        /// and could make the trained centroids non-finite. `checkVectorIsSane` in
+        /// `MergeTreeIndexVectorSimilarity.cpp` rejects them for the same reason.
         ///
-        /// A zero vector has no direction, so cosine against it is undefined. Under `spherical = 1` every
-        /// centroid is meant to be a unit direction, so reject rather than let a zero-norm point drag a
-        /// cluster mean toward the origin.
+        /// Under `cosine_distance = 1` a zero-norm vector is rejected too, because cosine needs a direction.
         const Float limit = coordinateLimit(length);
-        double norm2 = 0;
-        for (size_t j = 0; j < length; ++j)
+        double sq_norm = 0;
+        for (size_t coord = 0; coord < length; ++coord)
         {
-            const Float x = coord(j);
-            if (!std::isfinite(x))
+            const Float value = read_coordinate(coord);
+            if (!std::isfinite(value))
                 throw Exception(ErrorCodes::INCORRECT_DATA,
                     "hierarchicalKMeans: input vector must not contain non-finite values (NaN or Inf)");
-            if (std::abs(x) > limit)
+            if (std::abs(value) > limit)
                 throw Exception(ErrorCodes::INCORRECT_DATA,
                     "hierarchicalKMeans: coordinate {} exceeds the largest magnitude the Float32 training "
-                    "math can represent for dimension {} ({})", x, length, limit);
-            norm2 += static_cast<double>(x) * static_cast<double>(x);
+                    "math can represent for dimension {} ({})", value, length, limit);
+            sq_norm += static_cast<double>(value) * static_cast<double>(value);
         }
-        if (spherical && norm2 == 0)
+        if (spherical && sq_norm == 0)
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "hierarchicalKMeans: zero-norm vectors are not allowed with spherical = 1 "
+                "hierarchicalKMeans: zero-norm vectors are not allowed with cosine_distance = 1 "
                 "(cosine is undefined for a vector with no direction)");
 
-        /// Float32 keeps its memcpy; the other widths convert straight into the reservoir slot.
+        /// Float32 is copied as is; the other widths convert straight into the reservoir slot.
         if (nested_type == TypeIndex::Float32)
             data(place).addVector(
                 &assert_cast<const ColumnFloat32 &>(nested_col).getData()[start], static_cast<UInt32>(length), sample_cap);
         else
-            data(place).addVectorFrom(coord, static_cast<UInt32>(length), sample_cap);
+            data(place).addVectorFrom(read_coordinate, static_cast<UInt32>(length), sample_cap);
     }
 
     void mergeImpl(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs, Arena *) const override
@@ -1095,103 +1093,99 @@ public:
 
     void serialize(ConstAggregateDataPtr __restrict place, WriteBuffer & buf, std::optional<size_t>) const override
     {
-        const auto & d = data(place);
-        writeBinary(d.dim, buf);
-        writeBinary(d.seen, buf);
-        writeVarUInt(d.samples.size(), buf);
-        buf.write(reinterpret_cast<const char *>(d.samples.data()), d.samples.size() * sizeof(Float));
+        const auto & state = data(place);
+        writeVarUInt(state.dim, buf);
+        writeVarUInt(state.seen, buf);
+        writeVarUInt(state.samples.size(), buf);
+        buf.write(reinterpret_cast<const char *>(state.samples.data()), state.samples.size() * sizeof(Float));
 
-        /// The reservoir is only uniform if the PRNG keeps advancing across the serialization boundary. Without
-        /// this a state that crosses a distributed merge resumes from a default-constructed generator, so every
-        /// shard replays the same draws and later merges stop matching the pre-serialization behaviour.
+        /// The RNG is part of the state. Without it a deserialized state would resume from a default-constructed
+        /// generator, so every shard would replay the same draws and the reservoir would stop being uniform.
         WriteBufferFromOwnString rng_buf;
-        rng_buf << d.rng;
+        rng_buf << state.rng;
         writeStringBinary(rng_buf.str(), buf);
     }
 
     void deserialize(AggregateDataPtr __restrict place, ReadBuffer & buf, std::optional<size_t>, Arena *) const override
     {
-        auto & d = data(place);
-        readBinary(d.dim, buf);
-        readBinary(d.seen, buf);
-        size_t n = 0;
-        readVarUInt(n, buf);
+        auto & state = data(place);
+        readVarUInt(state.dim, buf);
+        readVarUInt(state.seen, buf);
+        size_t num_values = 0;
+        readVarUInt(num_values, buf);
 
-        /// Guard the `dim > 0 whenever there are rows` invariant that the rest of the state relies on, rather
-        /// than dividing by zero later on a corrupt or hostile state.
-        if (n > 0 && (d.dim == 0 || n % d.dim != 0))
+        /// Every later division by `dim` assumes it is non-zero whenever there are rows.
+        if (num_values > 0 && (state.dim == 0 || num_values % state.dim != 0))
             throw Exception(ErrorCodes::INCORRECT_DATA,
-                "hierarchicalKMeans: corrupt aggregate state ({} values for dimension {})", n, d.dim);
+                "hierarchicalKMeans: corrupt aggregate state ({} values for dimension {})", num_values, state.dim);
 
-        /// States are user-transportable via `hierarchicalKMeansState`, so everything read above is untrusted.
-        /// Re-establish the full reservoir invariant, not just an upper bound: `merge` reads `seen > cap` as
-        /// proof that the side holds exactly `cap` rows and indexes on that basis, so a state claiming
-        /// `seen = cap + 1` while storing one row would walk off the end of `samples`.
-        const UInt64 have = d.dim ? n / d.dim : 0;
-        const UInt64 expected = std::min<UInt64>(d.seen, sample_cap);
+        /// `hierarchicalKMeansState` hands states to the user, so everything read above is untrusted.
+        /// `merge` treats `seen > cap` as proof that the side holds exactly `cap` rows and indexes on that
+        /// basis, so the row count has to match `seen` exactly, not merely stay under it.
+        const UInt64 have = state.dim ? num_values / state.dim : 0;
+        const UInt64 expected = std::min<UInt64>(state.seen, sample_cap);
         if (have != expected)
             throw Exception(ErrorCodes::INCORRECT_DATA,
                 "hierarchicalKMeans: aggregate state holds {} vectors, but seen = {} with sample_cap = {} "
-                "requires exactly {}", have, d.seen, sample_cap, expected);
+                "requires exactly {}", have, state.seen, sample_cap, expected);
 
-        d.samples.resize(n);
-        buf.readStrict(reinterpret_cast<char *>(d.samples.data()), n * sizeof(Float));
+        state.samples.resize(num_values);
+        buf.readStrict(reinterpret_cast<char *>(state.samples.data()), num_values * sizeof(Float));
 
-        /// `add` enforces these on the way in, but a transported state bypasses `add` entirely, so both
-        /// contracts have to be re-established before the payload can reach `kMeansLloyd`.
-        const Float limit = d.dim ? coordinateLimit(d.dim) : 0;
-        for (UInt64 i = 0; i < have; ++i)
+        /// `add` checks these on the way in, and a transported state never went through `add`.
+        const Float limit = state.dim ? coordinateLimit(state.dim) : 0;
+        for (UInt64 row = 0; row < have; ++row)
         {
-            double norm2 = 0;
-            for (UInt64 j = 0; j < d.dim; ++j)
+            double sq_norm = 0;
+            for (UInt64 coord = 0; coord < state.dim; ++coord)
             {
-                const Float x = d.samples[i * d.dim + j];
-                if (!std::isfinite(x))
+                const Float value = state.samples[row * state.dim + coord];
+                if (!std::isfinite(value))
                     throw Exception(ErrorCodes::INCORRECT_DATA,
                         "hierarchicalKMeans: aggregate state contains non-finite values (NaN or Inf)");
-                if (std::abs(x) > limit)
+                if (std::abs(value) > limit)
                     throw Exception(ErrorCodes::INCORRECT_DATA,
                         "hierarchicalKMeans: aggregate state contains coordinate {}, above the largest "
                         "magnitude the Float32 training math can represent for dimension {} ({})",
-                        x, d.dim, limit);
-                norm2 += static_cast<double>(x) * static_cast<double>(x);
+                        value, state.dim, limit);
+                sq_norm += static_cast<double>(value) * static_cast<double>(value);
             }
-            if (spherical && norm2 == 0)
+            if (spherical && sq_norm == 0)
                 throw Exception(ErrorCodes::INCORRECT_DATA,
-                    "hierarchicalKMeans: aggregate state contains a zero-norm vector, which spherical = 1 "
+                    "hierarchicalKMeans: aggregate state contains a zero-norm vector, which cosine_distance = 1 "
                     "does not allow");
         }
 
         String rng_string;
         readStringBinary(rng_string, buf);
         ReadBufferFromString rng_buf(rng_string);
-        rng_buf >> d.rng;
+        rng_buf >> state.rng;
     }
 
     void insertResultInto(AggregateDataPtr __restrict place, IColumn & to, Arena *) const override
     {
-        auto & d = data(place);
-        auto & outer = assert_cast<ColumnArray &>(to);
-        auto & inner = assert_cast<ColumnArray &>(outer.getData());
-        auto & values = assert_cast<ColumnFloat32 &>(inner.getData()).getData();
+        auto & state = data(place);
+        auto & outer_array = assert_cast<ColumnArray &>(to);
+        auto & inner_array = assert_cast<ColumnArray &>(outer_array.getData());
+        auto & values = assert_cast<ColumnFloat32 &>(inner_array.getData()).getData();
 
-        if (d.dim == 0) /// empty input -> empty array of centroids
+        if (state.dim == 0) /// empty input -> empty array of centroids
         {
-            outer.getOffsets().push_back(inner.getOffsets().size());
+            outer_array.getOffsets().push_back(inner_array.getOffsets().size());
             return;
         }
 
         PaddedPODArray<Float> centroids;
         trainHierarchical(
-            d.samples.data(), d.samples.size() / d.dim, d.dim, k, branching, max_iter, spherical, seed, centroids);
+            state.samples.data(), state.samples.size() / state.dim, state.dim, k, branching, max_iter, spherical, seed, centroids);
 
-        size_t produced = centroids.size() / d.dim;
-        for (size_t c = 0; c < produced; ++c)
+        size_t num_produced = centroids.size() / state.dim;
+        for (size_t centroid_index = 0; centroid_index < num_produced; ++centroid_index)
         {
-            values.insert(centroids.data() + c * d.dim, centroids.data() + (c + 1) * d.dim);
-            inner.getOffsets().push_back(values.size());
+            values.insert(centroids.data() + centroid_index * state.dim, centroids.data() + (centroid_index + 1) * state.dim);
+            inner_array.getOffsets().push_back(values.size());
         }
-        outer.getOffsets().push_back(inner.getOffsets().size());
+        outer_array.getOffsets().push_back(inner_array.getOffsets().size());
     }
 };
 
@@ -1214,12 +1208,12 @@ void registerAggregateFunctionHierarchicalKMeans(AggregateFunctionFactory & fact
         "Trains up to `k` cluster centroids from the aggregated vectors using hierarchical k-means and returns "
         "them as `Array(Array(Float32))`. Fewer than `k` are returned only when the input has fewer than `k` rows, "
         "since a row can yield at most one centroid; repeated points still yield `k`. Distance is squared L2; "
-        "pass `spherical = 1` to "
+        "pass `cosine_distance = 1` to "
         "renormalize the centroids to unit length after each iteration, which makes the same centroids an exact "
         "cosine/inner-product quantizer.";
-    FunctionDocumentation::Syntax syntax = "hierarchicalKMeans(k[, branching[, max_iter[, sample_cap[, seed[, spherical]]]]])(vec)";
+    FunctionDocumentation::Syntax syntax = "hierarchicalKMeans(k[, branching[, max_iter[, sample_cap[, seed[, cosine_distance]]]]])(vec)";
     FunctionDocumentation::Arguments arguments = {
-        {"vec", "Vector to cluster. Every row must have the same dimension, and every coordinate must be finite. "
+        {"vec", "Vectors to cluster. Every row must have the same dimension, and every coordinate must be finite. "
                 "Widths other than `Float32` are converted to `Float32`, which is what the training kernels use.",
          {"Array(Float32)", "Array(Float64)", "Array(BFloat16)"}}
     };
@@ -1235,9 +1229,10 @@ void registerAggregateFunctionHierarchicalKMeans(AggregateFunctionFactory & fact
                        "4294967295. Default value: 1000000.", {"UInt*"}},
         {"seed", "Optional. Seed of the reservoir sampling and of the k-means++ initialization. A given seed makes "
                  "training reproducible for a given input order. Default value: 0.", {"UInt*"}},
-        {"spherical", "Optional. Set to 1 to renormalize the centroids to unit length after every iteration, which makes "
-                      "them an exact cosine/inner-product quantizer. Zero-norm input vectors are then rejected, because "
-                      "cosine is undefined for a vector with no direction. Default value: 0.", {"UInt*"}}
+        {"cosine_distance", "Optional. Set to 1 to renormalize the centroids to unit length after every iteration, "
+                            "which makes them an exact cosine/inner-product quantizer. A zero-norm input vector then "
+                            "throws an exception rather than being clustered, because cosine is undefined for a vector "
+                            "with no direction. Default value: 0.", {"UInt*"}}
     };
     FunctionDocumentation::ReturnedValue returned_value =
         {"An array of up to k centroids, capped by the number of input rows.", {"Array(Array(Float32))"}};

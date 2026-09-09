@@ -34,8 +34,8 @@ SELECT
     (SELECT hierarchicalKMeans(8, 16, 20, 1000000, 42)(v) FROM blobs)
         = (SELECT hierarchicalKMeans(8, 16, 20, 1000000, 42)(v) FROM blobs) AS same_seed_stable;
 
-SELECT '-- spherical = 1 makes every centroid unit length';
--- Own data rather than `blobs`: that table contains exact [0, 0] rows, which spherical mode rejects.
+SELECT '-- cosine_distance = 1 makes every centroid unit length';
+-- Own data rather than `blobs`: that table contains exact [0, 0] rows, which cosine_distance = 1 rejects.
 SELECT round(min(n), 5), round(max(n), 5) FROM (
     SELECT arrayJoin(arrayMap(x -> sqrt(arraySum(y -> y * y, x)),
         (SELECT hierarchicalKMeans(16, 16, 20, 1000000, 0, 1)(v) FROM (
@@ -106,7 +106,7 @@ SELECT hierarchicalKMeans(4, 16, 20, 5000000000)(v) FROM blobs; -- { serverError
 SELECT hierarchicalKMeans(2, 16, 20, 1)(v) FROM blobs; -- { serverError BAD_ARGUMENTS }
 -- A hand-written state must not be trusted to size an allocation: this one claims 1M vectors of
 -- dimension 3 while sample_cap is 5.
-SELECT finalizeAggregation(CAST(unhex('030000006400000000000000C08DB701'),
+SELECT finalizeAggregation(CAST(unhex('0364C08DB701'),
     'AggregateFunction(hierarchicalKMeans(2, 16, 20, 5), Array(Float32))')); -- { serverError INCORRECT_DATA }
 
 -- Ragged input: all vectors must share a dimension.
