@@ -86,6 +86,8 @@ gcloud compute networks subnets create <psc-subnet-name> \
     --purpose=PRIVATE_SERVICE_CONNECT
 ```
 
+See GCP's [NAT subnet sizing guidance](https://cloud.google.com/vpc/docs/about-vpc-hosted-services#subnet-capacity) when choosing the `<cidr-range>`.
+
 When you enable private link on a BYO-VPC infrastructure, the console asks for the **PSC subnet name**. Enter the name of the subnet you created.
 
 <Note>
